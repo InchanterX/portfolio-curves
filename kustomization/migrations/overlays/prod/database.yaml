@@ -1,0 +1,12 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrations
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        env:
+        - name: PG_HOST
+          value: postgres.curves-postgres-prod.svc.cluster.local

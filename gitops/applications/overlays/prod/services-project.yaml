@@ -1,0 +1,53 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: curves-services-prod
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: '-3'
+spec:
+  sourceRepos:
+  - https://github.com/InchanterX/portfolio-curves.git
+  destinations:
+  - server: https://kubernetes.default.svc
+    namespace: curves-postgres-prod
+  - server: https://kubernetes.default.svc
+    namespace: curves-analyzer-service-prod
+  - server: https://kubernetes.default.svc
+    namespace: curves-webapi-service-prod
+  - server: https://kubernetes.default.svc
+    namespace: curves-frontend-prod
+  - server: https://kubernetes.default.svc
+    namespace: curves-collector-job-prod
+  - server: https://kubernetes.default.svc
+    namespace: curves-migrations-prod
+  orphanedResources:
+    warn: true
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+  - group: ''
+    kind: Service
+  - group: ''
+    kind: ServiceAccount
+  - group: ''
+    kind: PersistentVolumeClaim
+  - group: ''
+    kind: Secret
+  - group: ''
+    kind: ConfigMap
+  - group: apps
+    kind: Deployment
+  - group: apps
+    kind: StatefulSet
+  - group: batch
+    kind: Job
+  - group: batch
+    kind: CronJob
+  - group: bitnami.com
+    kind: SealedSecret
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+  - group: autoscaling
+    kind: HorizontalPodAutoscaler
+  - group: autoscaling.k8s.io
+    kind: VerticalPodAutoscaler
