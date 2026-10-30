@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: analyzer-service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: analyzer-service
+    app.kubernetes.io/part-of: curves
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http

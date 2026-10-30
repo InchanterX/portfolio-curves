@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../base
+- route.yaml
+- hpa.yaml
+namespace: curves-webapi-service-prod
+patches:
+- path: database.yaml
+images:
+- name: registry.faberge-eggs.ru/curves/webapi-service
+  newTag: latest

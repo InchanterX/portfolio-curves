@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../base
+- postgres-namespace.yaml
+- postgres-limitrange.yaml
+- postgres-quota.yaml
+- analyzer-service-namespace.yaml
+- analyzer-service-limitrange.yaml
+- analyzer-service-quota.yaml
+- webapi-service-namespace.yaml
+- webapi-service-limitrange.yaml
+- webapi-service-quota.yaml
+- frontend-namespace.yaml
+- frontend-limitrange.yaml
+- frontend-quota.yaml
+- collector-job-namespace.yaml
+- collector-job-limitrange.yaml
+- collector-job-quota.yaml
+- migrations-namespace.yaml
+- migrations-limitrange.yaml
+- migrations-quota.yaml

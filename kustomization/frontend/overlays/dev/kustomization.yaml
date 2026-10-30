@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../base
+- route.yaml
+namespace: curves-frontend-dev
+images:
+- name: registry.faberge-eggs.ru/curves/frontend
+  newTag: latest
