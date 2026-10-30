@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrations
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrations
+        app.kubernetes.io/part-of: curves
+    spec:
+      serviceAccountName: app
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: app
+        image: registry.faberge-eggs.ru/curves/migrations:latest
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        env:
+        - name: PG_USER
+          value: curves
+        - name: PG_HOST
+          value: postgres
+        - name: PG_PORT
+          value: '5432'
+        - name: PG_DB
+          value: curves_db
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-auth
+              key: POSTGRES_PASSWORD
+        - name: DATABASE_DSN
+          value: postgresql://$(PG_USER):$(POSTGRES_PASSWORD)@$(PG_HOST):$(PG_PORT)/$(PG_DB)
+      restartPolicy: Never

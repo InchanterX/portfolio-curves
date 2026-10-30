@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-auth
+  namespace: REPLACE_WITH_TARGET_NAMESPACE
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: REPLACE_BEFORE_SEALING

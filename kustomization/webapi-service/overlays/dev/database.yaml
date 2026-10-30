@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapi-service
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        env:
+        - name: PG_HOST
+          value: postgres.curves-postgres-dev.svc.cluster.local

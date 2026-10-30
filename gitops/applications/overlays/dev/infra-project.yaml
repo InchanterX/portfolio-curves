@@ -1,0 +1,33 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: curves-infra-dev
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: '-3'
+spec:
+  sourceRepos:
+  - https://github.com/InchanterX/portfolio-curves.git
+  destinations:
+  - server: https://kubernetes.default.svc
+    namespace: curves-postgres-dev
+  - server: https://kubernetes.default.svc
+    namespace: curves-analyzer-service-dev
+  - server: https://kubernetes.default.svc
+    namespace: curves-webapi-service-dev
+  - server: https://kubernetes.default.svc
+    namespace: curves-frontend-dev
+  - server: https://kubernetes.default.svc
+    namespace: curves-collector-job-dev
+  - server: https://kubernetes.default.svc
+    namespace: curves-migrations-dev
+  orphanedResources:
+    warn: true
+  clusterResourceWhitelist:
+  - group: ''
+    kind: Namespace
+  namespaceResourceWhitelist:
+  - group: ''
+    kind: LimitRange
+  - group: ''
+    kind: ResourceQuota
