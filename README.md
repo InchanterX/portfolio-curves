@@ -1,1 +1,0 @@
-MOEX's curves analysis service.
