@@ -1,0 +1,22 @@
+name: Web API tests
+on:
+  pull_request:
+    paths:
+      - 'webapi_service/**'
+      - '.github/workflows/webapi-tests.yml'
+  workflow_dispatch:
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r webapi_service/requirements-dev.txt
+      - run: docker compose -p curves-webapi-test -f webapi_service/compose.test.yaml up -d --wait
+      - run: python -m pytest webapi_service/tests -q
+        env:
+          TEST_DATABASE_DSN: postgresql://webapi_test:isolated-test-only@127.0.0.1:55432/curves_webapi_test
+      - if: always()
+        run: docker compose -p curves-webapi-test -f webapi_service/compose.test.yaml down
