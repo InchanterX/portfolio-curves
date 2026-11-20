@@ -1,0 +1,55 @@
+import { setupEnterpriseOnlyPlugin } from "__support__/enterprise";
+import { setupDatabasesEndpoints } from "__support__/server-mocks";
+import { mockSettings } from "__support__/settings";
+import { createMockState } from "__support__/state";
+import { renderWithProviders } from "__support__/ui";
+import type { URLSearchFilterQueryParams } from "metabase/common/search/types";
+import { SearchSidebar } from "metabase/search/components/SearchSidebar";
+import type { TokenFeatures } from "metabase-types/api";
+import {
+  createMockDatabase,
+  createMockTokenFeatures,
+  createMockUser,
+} from "metabase-types/api/mocks";
+
+export interface SearchSidebarSetupOptions {
+  tokenFeatures?: TokenFeatures;
+  enterprisePlugins?: Parameters<typeof setupEnterpriseOnlyPlugin>[0][];
+  value?: URLSearchFilterQueryParams;
+  onChange?: (filters: URLSearchFilterQueryParams) => void;
+  isAdmin?: boolean;
+  activeUsersCount?: number;
+}
+
+const TEST_DATABASE = createMockDatabase();
+
+export const setup = ({
+  tokenFeatures = createMockTokenFeatures(),
+  enterprisePlugins,
+  value = {},
+  onChange = jest.fn(),
+  isAdmin = false,
+  activeUsersCount,
+}: SearchSidebarSetupOptions = {}) => {
+  setupDatabasesEndpoints([TEST_DATABASE]);
+
+  const settings = mockSettings({
+    "token-features": tokenFeatures,
+    "active-users-count": activeUsersCount,
+  });
+
+  const state = createMockState({
+    settings,
+    currentUser: createMockUser({ is_superuser: isAdmin }),
+  });
+
+  if (enterprisePlugins) {
+    enterprisePlugins.forEach((plugin) => {
+      setupEnterpriseOnlyPlugin(plugin);
+    });
+  }
+
+  renderWithProviders(<SearchSidebar value={value} onChange={onChange} />, {
+    storeInitialState: state,
+  });
+};

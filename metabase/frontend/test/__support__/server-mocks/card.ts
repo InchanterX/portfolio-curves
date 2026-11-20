@@ -1,0 +1,275 @@
+import fetchMock from "fetch-mock";
+
+import type {
+  Card,
+  CardId,
+  CardQueryMetadata,
+  DashboardId,
+  Dataset,
+  FieldValue,
+  GetPublicCard,
+  ParameterId,
+  ParameterValues,
+  TableId,
+} from "metabase-types/api";
+import { createMockCard } from "metabase-types/api/mocks";
+
+import { PERMISSION_ERROR } from "./constants";
+
+export function setupCardEndpoints(card: Card) {
+  fetchMock.get(`path:/api/card/${card.id}`, card, {
+    name: `card-${card.id}-get`,
+  });
+  fetchMock.put(
+    `path:/api/card/${card.id}`,
+    async (call) => {
+      const lastCall = fetchMock.callHistory.lastCall(call.url);
+      return createMockCard(await lastCall?.request?.json());
+    },
+    { name: `card-${card.id}-put` },
+  );
+  fetchMock.get(`path:/api/card/${card.id}/series`, [], {
+    name: `card-${card.id}-series`,
+  });
+}
+
+export function setupDeleteCardEndpoint(cardId: CardId) {
+  fetchMock.delete(`path:/api/card/${cardId}`, 204);
+}
+
+export function setupUpdateCardEndpointWithError(cardId: CardId) {
+  fetchMock.put(`path:/api/card/${cardId}`, { status: 500, body: {} });
+}
+
+export function setupCardByEntityIdEndpoints(card: Card) {
+  fetchMock.get(`path:/api/card/${card.entity_id}`, card, {
+    name: `card-entity-${card.entity_id}-get`,
+  });
+  fetchMock.put(
+    `path:/api/card/${card.entity_id}`,
+    async (call) => {
+      const lastCall = fetchMock.callHistory.lastCall(call.url);
+      return createMockCard(await lastCall?.request?.json());
+    },
+    { name: `card-entity-${card.entity_id}-put` },
+  );
+  fetchMock.get(`path:/api/card/${card.entity_id}/series`, [], {
+    name: `card-entity-${card.entity_id}-series`,
+  });
+}
+
+export function setupCardQueryMetadataEndpoint(
+  card: Card,
+  metadata: CardQueryMetadata,
+) {
+  fetchMock.get(`path:/api/card/${card.id}/query_metadata`, metadata, {
+    name: `card-${card.id}-query-metadata`,
+  });
+}
+
+export function setupCardsEndpoints(cards: Card[]) {
+  fetchMock.get({
+    url: "path:/api/card",
+    response: cards,
+    name: "cards-list",
+  });
+  setupCardCreateEndpoint();
+  cards.forEach((card) => setupCardEndpoints(card));
+}
+
+export function setupCardsUsingModelEndpoint(card: Card, usedBy: Card[] = []) {
+  fetchMock.get({
+    url: "path:/api/card",
+    query: { f: "using_model", model_id: card.id },
+    response: usedBy,
+  });
+}
+
+export function setupCardsForTableEndpoint(
+  tableId: TableId,
+  cards: Card[] = [],
+) {
+  fetchMock.get({
+    url: "path:/api/card",
+    query: { f: "table", model_id: tableId },
+    response: cards,
+  });
+}
+
+export function setupCardCreateEndpoint() {
+  fetchMock.post(
+    "path:/api/card",
+    async (call) => {
+      const lastCall = fetchMock.callHistory.lastCall(call.url);
+      return createMockCard(await lastCall?.request?.json());
+    },
+    { name: "card-create" },
+  );
+}
+
+export function setupUnauthorizedCardEndpoints(card: Card) {
+  fetchMock.get(`path:/api/card/${card.id}`, {
+    status: 403,
+    body: PERMISSION_ERROR,
+  });
+  fetchMock.get(`path:/api/card/${card.id}/query_metadata`, {
+    status: 403,
+    body: PERMISSION_ERROR,
+  });
+}
+
+export function setupUnauthorizedCardsEndpoints(cards: Card[]) {
+  cards.forEach((card) => setupUnauthorizedCardEndpoints(card));
+}
+
+/**
+ * Makes the card's own endpoints (the card, its query metadata, and running its
+ * query) all return 403, i.e. a card the current user has no access to at all.
+ */
+export function setupForbiddenCardEndpoints(cardId: CardId) {
+  fetchMock.get(`path:/api/card/${cardId}`, {
+    status: 403,
+    body: PERMISSION_ERROR,
+  });
+  fetchMock.get(`path:/api/card/${cardId}/query_metadata`, {
+    status: 403,
+    body: PERMISSION_ERROR,
+  });
+  fetchMock.post(`path:/api/card/${cardId}/query`, {
+    status: 403,
+    body: PERMISSION_ERROR,
+  });
+}
+
+/**
+ * Makes the card's own endpoints return 404, i.e. a card that was permanently
+ * deleted.
+ */
+export function setupNotFoundCardEndpoints(cardId: CardId) {
+  fetchMock.get(`path:/api/card/${cardId}`, {
+    status: 404,
+    body: "Not found.",
+  });
+  fetchMock.get(`path:/api/card/${cardId}/query_metadata`, {
+    status: 404,
+    body: "Not found.",
+  });
+  fetchMock.post(`path:/api/card/${cardId}/query`, {
+    status: 404,
+    body: "Not found.",
+  });
+}
+
+type SetupCardQueryEndpointsOpts = {
+  /**
+   * Return the request's parameters in `json_query.parameters`, as the real
+   * API does. The query builder compares them with the next-run parameters.
+   */
+  echoParameters?: boolean;
+};
+
+export function setupCardQueryEndpoints(
+  card: Card,
+  // A promise holds the response until the test resolves it
+  dataset: Dataset | Promise<Dataset>,
+  { echoParameters = false }: SetupCardQueryEndpointsOpts = {},
+) {
+  if (!echoParameters) {
+    fetchMock.post(`path:/api/card/${card.id}/query`, dataset);
+    return;
+  }
+
+  fetchMock.post(`path:/api/card/${card.id}/query`, async (call) => {
+    const resolvedDataset = await dataset;
+    const body: unknown = JSON.parse(String(call.options.body ?? "{}"));
+    const parameters =
+      typeof body === "object" && body != null && "parameters" in body
+        ? body.parameters
+        : [];
+    return {
+      ...resolvedDataset,
+      json_query: { ...resolvedDataset.json_query, parameters },
+    };
+  });
+}
+
+export function setupCardQueryDownloadEndpoint(card: Card, type: string) {
+  fetchMock.post(`path:/api/card/${card.id}/query/${type}`, {});
+}
+
+export function setupCardPublicLinkEndpoints(cardId: CardId) {
+  fetchMock.post(`path:/api/card/${cardId}/public_link`, {
+    id: cardId,
+    uuid: "mock-uuid",
+  });
+  fetchMock.delete(`path:/api/card/${cardId}/public_link`, {
+    id: cardId,
+  });
+}
+
+export function setupListPublicCardsEndpoint(publicCards: GetPublicCard[]) {
+  fetchMock.get("path:/api/card/public", publicCards);
+}
+
+export function setupCardDashboardsEndpoint(
+  cardId: CardId,
+  dashboards: { id: DashboardId; name: string; enable_embedding: boolean }[],
+) {
+  fetchMock.get(`path:/api/card/${cardId}/dashboards`, dashboards, {
+    name: `card-${cardId}-dashboards`,
+  });
+}
+
+export function setupCardParameterValuesEndpoint({
+  cardId,
+  parameterId,
+  parameterValues,
+}: {
+  cardId: CardId;
+  parameterId: ParameterId;
+  parameterValues: ParameterValues;
+}) {
+  fetchMock.get(
+    `path:/api/card/${cardId}/params/${parameterId}/values`,
+    parameterValues,
+  );
+}
+
+export function setupCardParameterRemappingEndpoint({
+  cardId,
+  parameterId,
+  remappings,
+}: {
+  cardId: CardId;
+  parameterId: ParameterId;
+  remappings: FieldValue[];
+}) {
+  fetchMock.get(
+    `path:/api/card/${cardId}/params/${parameterId}/remapping`,
+    ({ url }) => {
+      const value = new URL(url).searchParams.get("value");
+      return (
+        remappings.find(
+          ([remappedValue]) => String(remappedValue) === value,
+        ) ?? [value]
+      );
+    },
+  );
+}
+
+export function setupCardParameterSearchEndpoint({
+  cardId,
+  parameterId,
+  query,
+  parameterValues,
+}: {
+  cardId: CardId;
+  parameterId: ParameterId;
+  query: string;
+  parameterValues: ParameterValues;
+}) {
+  fetchMock.get(
+    `path:/api/card/${cardId}/params/${parameterId}/search/${encodeURIComponent(query)}`,
+    parameterValues,
+  );
+}

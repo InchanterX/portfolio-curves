@@ -1,0 +1,51 @@
+import { formatNumber as appFormatNumber } from "metabase/utils/formatting";
+import type {
+  CurrencyPosition,
+  CurrencyStyle,
+  DurationStyle,
+  DurationUnit,
+} from "metabase-types/api";
+
+export type NumberStyle =
+  | "currency"
+  | "decimal"
+  | "scientific"
+  | "percent"
+  | "duration";
+
+export type NumberFormatOptions = {
+  number_style?: NumberStyle;
+  currency?: string;
+  currency_style?: CurrencyStyle;
+  currency_position?: CurrencyPosition;
+  number_separators?: string;
+  decimals?: number;
+  duration_precision?: DurationUnit;
+  duration_style?: DurationStyle;
+  duration_unit?: DurationUnit;
+  scale?: number;
+  prefix?: string;
+  suffix?: string;
+  compact?: boolean;
+};
+
+const DEFAULT_OPTIONS = {
+  number_style: "decimal" as const,
+  currency: undefined,
+  currency_style: "symbol",
+  number_separators: ".,",
+  decimals: undefined,
+  scale: 1,
+  prefix: "",
+  suffix: "",
+};
+
+export const formatNumber = (number: number, options?: NumberFormatOptions) => {
+  const optionsWithDefault = {
+    ...DEFAULT_OPTIONS,
+    ...options,
+  };
+  const { prefix, suffix } = optionsWithDefault;
+
+  return `${prefix}${appFormatNumber(number, optionsWithDefault)}${suffix}`;
+};

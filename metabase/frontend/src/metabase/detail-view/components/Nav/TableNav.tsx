@@ -1,0 +1,81 @@
+import cx from "classnames";
+import type { ReactNode } from "react";
+
+import { skipToken, useListDatabaseSchemasQuery } from "metabase/api";
+import {
+  BREADCRUMB_TRAIL_CLASS_NAME,
+  Breadcrumb,
+} from "metabase/common/components/Breadcrumb";
+import { Group, type GroupProps } from "metabase/ui";
+import * as Urls from "metabase/urls";
+import type { Table } from "metabase-types/api";
+
+import { Separator } from "./Separator";
+
+interface Props extends GroupProps {
+  rowName: ReactNode;
+  table: Table;
+}
+
+export const TableNav = ({ rowName, table, className, ...props }: Props) => {
+  const { data: schemas, isLoading: isLoadingSchemas } =
+    useListDatabaseSchemasQuery(
+      table && table.db_id && table.schema ? { id: table.db_id } : skipToken,
+    );
+
+  if (!table || !table.db || isLoadingSchemas) {
+    return null;
+  }
+
+  return (
+    <Group
+      align="center"
+      className={cx(BREADCRUMB_TRAIL_CLASS_NAME, className)}
+      gap="sm"
+      miw={0}
+      wrap="nowrap"
+      {...props}
+    >
+      <Breadcrumb
+        icon="database"
+        to={Urls.browseDatabase(table.db)}
+        showTooltip
+      >
+        {table.db.name}
+      </Breadcrumb>
+
+      {schemas && schemas.length > 1 && table.schema && (
+        <>
+          <Separator />
+
+          <Breadcrumb
+            to={Urls.browseSchemaBySlug(
+              Urls.databaseSlug(table.db),
+              table.schema,
+            )}
+            showTooltip
+          >
+            {table.schema}
+          </Breadcrumb>
+        </>
+      )}
+
+      <Separator />
+
+      <Breadcrumb
+        to={Urls.table({ id: table.id, name: table.display_name })}
+        showTooltip
+      >
+        {table.display_name}
+      </Breadcrumb>
+
+      {rowName && (
+        <>
+          <Separator />
+
+          <Breadcrumb showTooltip>{rowName}</Breadcrumb>
+        </>
+      )}
+    </Group>
+  );
+};

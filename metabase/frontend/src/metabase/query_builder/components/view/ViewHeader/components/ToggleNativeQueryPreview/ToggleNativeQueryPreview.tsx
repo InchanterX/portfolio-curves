@@ -1,0 +1,76 @@
+import type { JSX } from "react";
+import { t } from "ttag";
+
+import { getEngineNativeType } from "metabase/databases/utils/engine";
+import { useDispatch, useSelector } from "metabase/redux";
+import { setUIControls } from "metabase/redux/query-builder";
+import { ActionIcon, Icon, Tooltip } from "metabase/ui";
+import * as Lib from "metabase-lib";
+import type Question from "metabase-lib/v1/Question";
+
+import { trackNotebookNativePreviewShown } from "../../../../../analytics";
+import { getUiControls } from "../../../../../store/selectors";
+import { canShowNativePreview } from "../../utils";
+
+const BUTTON_TEXT = {
+  get sql() {
+    return t`View SQL`;
+  },
+  get json() {
+    return t`View native query`;
+  },
+};
+
+const BUTTON_CLOSE_TEXT = {
+  get sql() {
+    return t`Hide SQL`;
+  },
+  get json() {
+    return t`Hide native query`;
+  },
+};
+
+interface ToggleNativeQueryPreviewProps {
+  question: Question;
+}
+
+export const ToggleNativeQueryPreview = ({
+  question,
+}: ToggleNativeQueryPreviewProps): JSX.Element => {
+  const dispatch = useDispatch();
+  const {
+    isShowingNotebookNativePreview,
+  }: { isShowingNotebookNativePreview: boolean } = useSelector(getUiControls);
+
+  const engineType = getEngineNativeType(
+    Lib.databaseDisplayInfo(question.query())?.engine ?? undefined,
+  );
+  const buttonText = isShowingNotebookNativePreview
+    ? BUTTON_CLOSE_TEXT[engineType]
+    : BUTTON_TEXT[engineType];
+
+  const handleClick = () => {
+    dispatch(
+      setUIControls({
+        isShowingNotebookNativePreview: !isShowingNotebookNativePreview,
+      }),
+    );
+
+    trackNotebookNativePreviewShown(question, !isShowingNotebookNativePreview);
+  };
+
+  return (
+    <Tooltip label={buttonText} position="top">
+      <ActionIcon
+        variant="subtle"
+        aria-label={buttonText}
+        role="switch"
+        onClick={handleClick}
+      >
+        <Icon name="sql" />
+      </ActionIcon>
+    </Tooltip>
+  );
+};
+
+ToggleNativeQueryPreview.shouldRender = canShowNativePreview;

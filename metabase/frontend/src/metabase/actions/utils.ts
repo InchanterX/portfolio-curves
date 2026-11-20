@@ -1,0 +1,386 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- FIXME: any-typed values */
+import { match } from "ts-pattern";
+import { t } from "ttag";
+import * as Yup from "yup";
+
+import { findErrorMessage } from "metabase/api/utils/errors";
+import { hasActionsEnabled } from "metabase/common/utils/database";
+import type { ButtonProps } from "metabase/ui";
+import * as Errors from "metabase/utils/errors";
+import * as Lib from "metabase-lib";
+import type {
+  ActionDashboardCard,
+  ActionDisplayType,
+  ActionFormOption,
+  ActionFormSettings,
+  BaseDashboardCard,
+  Card,
+  Database,
+  FieldSettings,
+  FieldSettingsMap,
+  FieldType,
+  IconName,
+  InputComponentType,
+  InputSettingType,
+  Parameter,
+  VirtualCard,
+  WritebackAction,
+  WritebackActionBase,
+  WritebackImplicitQueryAction,
+  WritebackParameter,
+} from "metabase-types/api";
+
+import type {
+  ActionFormFieldProps,
+  ActionFormProps,
+  FieldSettings as LocalFieldSettings,
+} from "./types";
+
+type FieldPropTypeMap = Record<InputSettingType, InputComponentType>;
+
+const fieldPropsTypeMap: FieldPropTypeMap = {
+  string: "text",
+  text: "textarea",
+  date: "date",
+  datetime: "datetime-local",
+  time: "time",
+  number: "number",
+  boolean: "boolean",
+  select: "select",
+  radio: "radio",
+};
+
+const getOptionsFromArray = (
+  options: (number | string)[],
+): ActionFormOption[] => options.map((o) => ({ name: o, value: o }));
+
+function getSampleOptions(fieldType: FieldType) {
+  return fieldType === "number"
+    ? getOptionsFromArray([1, 2, 3])
+    : getOptionsFromArray([t`Option One`, t`Option Two`, t`Option Three`]);
+}
+
+export const inputTypeHasOptions = (inputType: InputSettingType) =>
+  ["select", "radio"].includes(inputType);
+
+export const sortActionParams =
+  (formSettings: ActionFormSettings) => (a: Parameter, b: Parameter) => {
+    const fields = formSettings.fields || {};
+
+    const aOrder = fields[a.id]?.order ?? 0;
+    const bOrder = fields[b.id]?.order ?? 0;
+
+    return aOrder - bOrder;
+  };
+
+export const getDefaultFormSettings = (
+  overrides: Partial<ActionFormSettings> = {},
+): ActionFormSettings => ({
+  name: "",
+  type: "button",
+  description: "",
+  fields: {},
+  confirmMessage: "",
+  successMessage: "",
+  ...overrides,
+});
+
+export const getSuccessMessage = (action: WritebackAction) => {
+  return (
+    action.visualization_settings?.successMessage ||
+    t`${action.name} ran successfully`
+  );
+};
+
+export const getDefaultFieldSettings = (
+  overrides: Partial<LocalFieldSettings> = {},
+): FieldSettings => ({
+  id: "",
+  name: "",
+  title: "",
+  description: "",
+  placeholder: "",
+  order: 999,
+  fieldType: "string",
+  inputType: "string",
+  required: true,
+  hidden: false,
+  width: "medium",
+  ...overrides,
+});
+
+export function isSavedAction(
+  action?: Partial<WritebackActionBase>,
+): action is WritebackAction {
+  return action != null && action.id != null;
+}
+
+export function isActionDashCard(
+  dashCard: BaseDashboardCard,
+): dashCard is ActionDashboardCard {
+  const virtualCard = dashCard?.visualization_settings?.virtual_card;
+  return isActionCard(virtualCard);
+}
+
+export const isActionCard = (card?: Card | VirtualCard) =>
+  card?.display === "action";
+
+/**
+ * How an action dashcard is shown: the given `actionDisplayType` (from the
+ * dashcard's visualization settings), else the action's own setting, else a
+ * button.
+ */
+export function getActionDisplayType(
+  actionDisplayType: ActionDisplayType | undefined,
+  action: Pick<WritebackAction, "visualization_settings"> | undefined,
+): ActionDisplayType {
+  return actionDisplayType ?? action?.visualization_settings?.type ?? "button";
+}
+
+export const getFormTitle = (action: WritebackAction): string => {
+  return action.visualization_settings?.name || action.name || t`Action form`;
+};
+
+function hasDataFromExplicitAction(result: any) {
+  const isInsert = result["created-row"];
+  const isUpdate = result["rows-affected"] > 0 || result["rows-updated"] > 0;
+  const isDelete = result["rows-deleted"]?.[0] > 0;
+  return !isInsert && !isUpdate && !isDelete;
+}
+
+function getImplicitActionExecutionMessage(
+  action: WritebackImplicitQueryAction,
+) {
+  if (action.kind === "row/create") {
+    return t`Successfully saved`;
+  }
+  if (action.kind === "row/update") {
+    return t`Successfully updated`;
+  }
+  if (action.kind === "row/delete") {
+    return t`Successfully deleted`;
+  }
+  return t`Successfully ran the action`;
+}
+
+export function getActionExecutionMessage(
+  action: WritebackAction,
+  result: any,
+) {
+  if (action.type === "implicit") {
+    return getImplicitActionExecutionMessage(action);
+  }
+  if (hasDataFromExplicitAction(result)) {
+    return t`Success! The action returned: ${JSON.stringify(result)}`;
+  }
+  return getSuccessMessage(action);
+}
+
+export function getActionErrorMessage(error: unknown) {
+  return (
+    findErrorMessage(error) ??
+    t`Something went wrong while executing the action`
+  );
+}
+
+const getFormField = (
+  parameter: Parameter,
+  fieldSettings: LocalFieldSettings,
+) => {
+  const fieldProps: ActionFormFieldProps = {
+    name: parameter.id,
+    type: fieldPropsTypeMap[fieldSettings?.inputType] ?? "text",
+    title:
+      fieldSettings.title ||
+      fieldSettings.name ||
+      parameter["display-name"] ||
+      parameter.name ||
+      parameter.id,
+    description: fieldSettings.description ?? "",
+    placeholder: fieldSettings?.placeholder,
+    // fieldSettings for implicit actions contain only `hidden` and `id`
+    // in this case we rely on required settings of parameter
+    optional: fieldSettings.required === false || parameter.required === false,
+  };
+
+  if (inputTypeHasOptions(fieldSettings.inputType)) {
+    fieldProps.options = fieldSettings.valueOptions?.length
+      ? getOptionsFromArray(fieldSettings.valueOptions)
+      : getSampleOptions(fieldSettings.fieldType);
+  }
+
+  return fieldProps;
+};
+
+export const getForm = (
+  parameters: WritebackParameter[] | Parameter[],
+  fieldSettings: Record<string, FieldSettings> = {},
+): ActionFormProps => {
+  const sortedParams = [...parameters].sort(
+    sortActionParams({ fields: fieldSettings }),
+  );
+  return {
+    fields: sortedParams.map((param) =>
+      getFormField(param, fieldSettings[param.id] ?? {}),
+    ),
+  };
+};
+
+const getFieldValidationType = ({
+  inputType,
+  defaultValue,
+}: FieldSettings): Yup.AnySchema => {
+  switch (inputType) {
+    case "number":
+      return Yup.number()
+        .nullable()
+        .default(defaultValue != null ? Number(defaultValue) : null);
+    case "boolean":
+      return Yup.boolean()
+        .nullable()
+        .default(defaultValue != null ? Boolean(defaultValue) : false);
+    case "date":
+    case "datetime":
+    case "time":
+      return Yup.string()
+        .nullable()
+        .default(defaultValue != null ? String(defaultValue) : null);
+    default:
+      return Yup.string()
+        .nullable()
+        .default(defaultValue != null ? String(defaultValue) : null);
+  }
+};
+
+export const getFormValidationSchema = (
+  parameters: WritebackParameter[] | Parameter[],
+  fieldSettings: FieldSettingsMap = {},
+) => {
+  const schema = Object.values(fieldSettings)
+    .filter((fieldSetting) =>
+      // only validate fields that are present in the form
+      parameters.find((parameter) => parameter.id === fieldSetting.id),
+    )
+    .map((fieldSetting) => {
+      let yupType = getFieldValidationType(fieldSetting);
+
+      if (fieldSetting.required) {
+        yupType = yupType.required(Errors.required);
+      }
+
+      return [fieldSetting.id, yupType];
+    });
+  return Yup.object(Object.fromEntries(schema));
+};
+
+export const getSubmitButtonColor = (
+  action: WritebackAction,
+): ButtonProps["color"] => {
+  if (isImplicitDeleteAction(action)) {
+    return "negative";
+  }
+
+  return match(action.visualization_settings?.submitButtonColor)
+    .returnType<ButtonProps["color"]>()
+    .with("danger", () => "negative")
+    .with("success", () => "positive")
+    .with("warning", () => "warning")
+    .otherwise(() => "brand");
+};
+
+export const getSubmitButtonLabel = (action: WritebackAction): string => {
+  if (action.visualization_settings?.submitButtonLabel) {
+    return action.visualization_settings.submitButtonLabel;
+  }
+
+  if (action.type === "implicit") {
+    if (action.kind === "row/delete") {
+      return t`Delete`;
+    }
+
+    if (action.kind === "row/update") {
+      return t`Update`;
+    }
+
+    if (action.kind === "row/create") {
+      return t`Save`;
+    }
+  }
+
+  return action.name;
+};
+
+export const isActionPublic = (action: Partial<WritebackAction>) => {
+  return action.public_uuid != null;
+};
+
+export const isImplicitDeleteAction = (action: WritebackAction): boolean =>
+  action.type === "implicit" && action.kind === "row/delete";
+
+export const isImplicitUpdateAction = (action: WritebackAction): boolean =>
+  action.type === "implicit" && action.kind === "row/update";
+
+export const isValidImplicitDeleteAction = (action: WritebackAction): boolean =>
+  isImplicitDeleteAction(action) && !action.archived;
+
+export const isValidImplicitUpdateAction = (action: WritebackAction): boolean =>
+  isImplicitUpdateAction(action) && !action.archived;
+
+export type ActionItem = {
+  title: string;
+  icon: IconName;
+  action: () => void;
+};
+
+// Accepts both plain API databases and metabase-lib Database wrappers.
+type DatabaseActionsSource = Pick<Database, "id" | "settings">;
+
+const canRunActionOnDatabase = (
+  action: WritebackAction,
+  databases: DatabaseActionsSource[],
+) => {
+  const database = databases.find(({ id }) => id === action.database_id);
+  return database != null && hasActionsEnabled(database);
+};
+
+export const getActionItems = ({
+  actions,
+  databases,
+  onDelete,
+  onUpdate,
+}: {
+  actions: WritebackAction[];
+  databases: DatabaseActionsSource[];
+  onDelete: (action: WritebackAction) => void;
+  onUpdate: (action: WritebackAction) => void;
+}): ActionItem[] => {
+  const actionItems: ActionItem[] = [];
+  // There is no endpoint for running public actions (#32320).
+  const privateActions = actions.filter((action) => !action.public_uuid);
+  const deleteAction = privateActions.find(isValidImplicitDeleteAction);
+  const updateAction = privateActions.find(isValidImplicitUpdateAction);
+
+  if (updateAction && canRunActionOnDatabase(updateAction, databases)) {
+    const action = () => onUpdate(updateAction);
+    actionItems.push({ title: t`Update`, icon: "pencil", action });
+  }
+
+  if (deleteAction && canRunActionOnDatabase(deleteAction, databases)) {
+    const action = () => onDelete(deleteAction);
+    actionItems.push({ title: t`Delete`, icon: "trash", action });
+  }
+
+  return actionItems;
+};
+
+export const supportsImplicitActions = (query: Lib.Query): boolean => {
+  const { isNative } = Lib.queryDisplayInfo(query);
+  if (isNative || Lib.hasClauses(query, -1)) {
+    return false;
+  }
+
+  const pkColumns = Lib.returnedColumns(query, -1).filter((column) =>
+    Lib.isPrimaryKey(column),
+  );
+  return pkColumns.length === 1;
+};

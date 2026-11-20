@@ -1,0 +1,144 @@
+(ns metabase.metabot.agent.memory
+  "Memory and state management for the agent loop.
+  Tracks conversation history, tool execution steps, and conversation state.
+
+  `:state` is the live working state readers see — the incoming baseline (prior
+  turns merged, plus seeded viewing context) with this turn's writes applied.
+  `:turn-state` accumulates *only* what this turn wrote, and is what gets
+  persisted to `metabot_message.state`; readers never touch it. Writers record
+  into both."
+  (:require
+   [clojure.string :as str]
+   [metabase.metabot.schema :as metabot.schema]))
+
+(defn merge-states
+  "Merge two partial states. Map entries (e.g. :queries) merge entry-wise;
+  other entries (e.g. :client-ids) take the later value."
+  [a b]
+  (merge-with (fn [x y] (if (every? map? [x y]) (merge x y) y)) a b))
+
+(defn initialize
+  "Initialize memory from input messages and the incoming baseline `state` (prior
+  turns merged, plus seeded viewing context)."
+  ([messages state]
+   (initialize messages state nil))
+  ([messages state context]
+   {:input-messages messages
+    :steps-taken    []
+    :context        context
+    :state          (metabot.schema/normalize-state
+                     (or state {:queries {} :charts {} :link-registry {}}))
+    :turn-state     {}}))
+
+(defn add-step
+  "Add a completed agent step to memory.
+  A step includes the LLM response parts (text, tool calls, tool results)."
+  [memory parts]
+  (update memory :steps-taken conj {:parts parts}))
+
+(defn- record
+  "Write `v` at `path` into both the live working `:state` and this turn's
+  `:turn-state` delta. Readers see it via `:state`; persistence keeps `:turn-state`."
+  [memory path v]
+  (-> memory
+      (assoc-in (into [:state] path) v)
+      (assoc-in (into [:turn-state] path) v)))
+
+(defn- record-client-id
+  "Persist `id` as client-supplied when [[add-client-ids]] marked it and it isn't recorded yet."
+  [memory id]
+  (let [recorded (set (get-in memory [:state :client-ids]))]
+    (if (and (contains? (:client-ids memory) id)
+             (not (contains? recorded id)))
+      (record memory [:client-ids] (conj recorded id))
+      memory)))
+
+(defn get-state
+  "The agent's current full working state."
+  [memory]
+  (:state memory))
+
+(defn turn-state
+  "Only this turn's state writes, or nil if the turn produced none. Persisted to
+  `metabot_message.state`; [[metabase.metabot.persistence/conversation-state]]
+  merges these across a conversation's rows to reconstruct the baseline."
+  [memory]
+  (not-empty (:turn-state memory)))
+
+(defn get-steps
+  "Get all steps taken by the agent so far."
+  [memory]
+  (:steps-taken memory))
+
+(defn get-input-messages
+  "Get the original input messages."
+  [memory]
+  (:input-messages memory))
+
+(defn iteration-count
+  "Get the number of iterations completed."
+  [memory]
+  (count (:steps-taken memory)))
+
+;;; Query Management
+
+(defn set-query
+  "Store a query in state by its query-id, and redraw every chart that holds a copy of the query under that id.
+  The SQL edit tools store an edited query under its old id, and a chart saved later must show the edited query.
+  Query should be an MBQL 4 (legacy) or MBQL 5 query map."
+  [memory query-id query]
+  (reduce (fn [memory [chart-id chart]]
+            (cond-> memory
+              (and (= query-id (:query_id chart)) (seq (:queries chart)))
+              (record [:charts chart-id] (assoc chart :queries [query]))))
+          (-> memory
+              (record [:queries query-id] query)
+              (record-client-id query-id))
+          (get-in memory [:state :charts])))
+
+(defn find-query
+  "Retrieve a query by its query-id. Throws if not found."
+  [memory query-id]
+  (let [queries (get-in memory [:state :queries] {})]
+    (if-let [query (get queries query-id)]
+      query
+      (throw (ex-info (str "Query with ID " query-id " not found in memory. "
+                           "Available queries: [" (str/join ", " (keys queries)) "]. "
+                           "Are you sure you were referring to a query ID?")
+                      {:agent-error? true
+                       :query-id query-id
+                       :available-queries (keys queries)})))))
+
+;;; Chart Management
+
+(defn set-chart
+  "Store a chart configuration in state by its chart-id."
+  [memory chart-id chart]
+  (-> memory
+      (record [:charts chart-id] chart)
+      (record-client-id chart-id)))
+
+(defn find-chart
+  "Retrieve a chart by its chart-id. Throws if not found."
+  [memory chart-id]
+  (let [charts (get-in memory [:state :charts] {})]
+    (if-let [chart (get charts chart-id)]
+      chart
+      (throw (ex-info (str "Chart with ID " chart-id " not found in memory. "
+                           "Available charts: [" (str/join ", " (keys charts)) "]")
+                      {:agent-error? true
+                       :chart-id chart-id
+                       :available-charts (keys charts)})))))
+
+(defn add-client-ids
+  "Mark `ids` as the queries and charts the client supplied this turn.
+  Each is persisted, with the ids earlier turns recorded, once a query or chart is stored under it."
+  [memory ids]
+  (update memory :client-ids (fnil into #{}) ids))
+
+(defn set-link-registry
+  "Set the link registry (url → stable id mappings)."
+  [memory link-registry]
+  (if (= (get-in memory [:state :link-registry] {}) link-registry)
+    memory
+    (record memory [:link-registry] link-registry)))

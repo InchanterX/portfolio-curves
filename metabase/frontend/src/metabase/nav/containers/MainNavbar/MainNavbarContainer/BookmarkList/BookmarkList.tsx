@@ -1,0 +1,240 @@
+import type { DragEndEvent } from "@dnd-kit/core";
+import { DndContext, PointerSensor, useSensor } from "@dnd-kit/core";
+import {
+  restrictToParentElement,
+  restrictToVerticalAxis,
+} from "@dnd-kit/modifiers";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import cx from "classnames";
+import {
+  type MouseEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { t } from "ttag";
+
+import { useDeleteBookmarkMutation } from "metabase/api";
+import { CollapseSection } from "metabase/common/components/CollapseSection";
+import { Sortable } from "metabase/common/components/Sortable";
+import GrabberS from "metabase/css/components/grabber.module.css";
+import CS from "metabase/css/core/index.css";
+import { getIsTenantUser } from "metabase/current-user";
+import { useGetIcon } from "metabase/hooks/use-icon";
+import { useSelector } from "metabase/redux";
+import { Icon, Tooltip } from "metabase/ui";
+import * as Urls from "metabase/urls";
+import { isFocusVisible } from "metabase/utils/dom";
+import type { Bookmark } from "metabase-types/api";
+
+import { SidebarHeading } from "../../Sidebar";
+import { DraggableSidebarLink } from "../../SidebarItems";
+import type { SelectedItem } from "../../types";
+
+import S from "./BookmarkList.module.css";
+
+interface CollectionSidebarBookmarksProps {
+  bookmarks: Bookmark[];
+  selectedItem?: SelectedItem;
+  onSelect: () => void;
+  reorderBookmarks: ({
+    newIndex,
+    oldIndex,
+  }: {
+    newIndex: number;
+    oldIndex: number;
+  }) => Promise<any>;
+  onToggle: (isExpanded: boolean) => void;
+  initialState: "expanded" | "collapsed";
+}
+
+interface BookmarkItemProps {
+  bookmark: Bookmark;
+  index: number;
+  isDraggable?: boolean;
+  isSorting: boolean;
+  selectedItem?: SelectedItem;
+  onSelect: () => void;
+  onDeleteBookmark: (
+    bookmark: Bookmark,
+    index: number,
+    button: HTMLButtonElement,
+  ) => void;
+}
+
+function isBookmarkSelected(bookmark: Bookmark, selectedItem?: SelectedItem) {
+  if (!selectedItem) {
+    return false;
+  }
+  return (
+    bookmark.type === selectedItem.type && bookmark.item_id === selectedItem.id
+  );
+}
+
+function getBookmarkModel(bookmark: Bookmark) {
+  // we should really fix this on the backend
+  switch (bookmark.card_type) {
+    case "model":
+      return "dataset";
+    case "metric":
+      return "metric";
+    default:
+      return bookmark.type;
+  }
+}
+
+const BookmarkItem = ({
+  bookmark,
+  index,
+  isDraggable,
+  isSorting,
+  selectedItem,
+  onSelect,
+  onDeleteBookmark,
+}: BookmarkItemProps) => {
+  const getIcon = useGetIcon();
+  const isSelected = isBookmarkSelected(bookmark, selectedItem);
+  const url = Urls.bookmark(bookmark);
+  const isTenantUser = useSelector(getIsTenantUser);
+
+  const icon = getIcon(
+    {
+      model: getBookmarkModel(bookmark),
+      display: bookmark.display,
+      authority_level: bookmark.authority_level,
+      is_remote_synced: bookmark.is_remote_synced,
+    },
+    { isTenantUser },
+  );
+  const onRemove = (event: MouseEvent<HTMLButtonElement>) =>
+    onDeleteBookmark(bookmark, index, event.currentTarget);
+
+  const iconName = isSelected ? "bookmark_filled" : "bookmark";
+
+  return (
+    <Sortable id={bookmark.id} key={bookmark.id}>
+      <DraggableSidebarLink
+        className={S.bookmark}
+        url={url}
+        icon={icon}
+        isSelected={isSelected}
+        isDragging={isSorting}
+        isDraggable={isDraggable}
+        onClick={onSelect}
+        right={
+          <Tooltip label={t`Remove bookmark`} position="right">
+            <button
+              className={cx(S.removeButton, CS.cursorPointer)}
+              aria-label={t`Remove bookmark`}
+              // The tooltip repeats the accessible name, so it mustn't also describe it.
+              aria-describedby={undefined}
+              onClick={onRemove}
+            >
+              <Icon name={iconName} />
+            </button>
+          </Tooltip>
+        }
+      >
+        {bookmark.name}
+      </DraggableSidebarLink>
+    </Sortable>
+  );
+};
+
+const BookmarkList = ({
+  bookmarks,
+  selectedItem,
+  onSelect,
+  reorderBookmarks,
+  onToggle,
+  initialState,
+}: CollectionSidebarBookmarksProps) => {
+  const [deleteBookmark] = useDeleteBookmarkMutation();
+  const listRef = useRef<HTMLUListElement>(null);
+  const onDeleteBookmark = (
+    { item_id, type }: Bookmark,
+    index: number,
+    button: HTMLButtonElement,
+  ) => {
+    // Removing the row takes the focused button with it, which drops focus to the page
+    if (isFocusVisible(button)) {
+      const links = listRef.current?.querySelectorAll("a");
+      (links?.[index + 1] ?? links?.[index - 1])?.focus();
+    }
+    deleteBookmark({ id: item_id, type });
+  };
+  const [orderedBookmarks, setOrderedBookmarks] = useState(bookmarks);
+  const [isSorting, setIsSorting] = useState(false);
+
+  useEffect(() => {
+    setOrderedBookmarks(bookmarks);
+  }, [bookmarks]);
+
+  const pointerSensor = useSensor(PointerSensor, {
+    activationConstraint: { distance: 15 },
+  });
+
+  const handleSortStart = useCallback(() => {
+    document.body.classList.add(GrabberS.grabbing);
+    setIsSorting(true);
+  }, []);
+
+  const handleSortEnd = useCallback(
+    async (input: DragEndEvent) => {
+      document.body.classList.remove(GrabberS.grabbing);
+      setIsSorting(false);
+      const newIndex = bookmarks.findIndex((b) => b.id === input.over?.id);
+      const oldIndex = bookmarks.findIndex((b) => b.id === input.active.id);
+      await reorderBookmarks({ newIndex, oldIndex });
+    },
+    [reorderBookmarks, bookmarks],
+  );
+
+  const bookmarkIds = bookmarks.map((b) => b.id);
+
+  return (
+    <CollapseSection
+      header={<SidebarHeading>{t`Bookmarks`}</SidebarHeading>}
+      initialState={initialState}
+      iconPosition="right"
+      iconSize={8}
+      role="section"
+      aria-label={t`Bookmarks`}
+      onToggle={onToggle}
+    >
+      <DndContext
+        onDragEnd={handleSortEnd}
+        onDragStart={handleSortStart}
+        modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+        sensors={[pointerSensor]}
+      >
+        <SortableContext
+          items={bookmarkIds ?? []}
+          strategy={verticalListSortingStrategy}
+        >
+          <ul ref={listRef}>
+            {orderedBookmarks.map((bookmark, index) => (
+              <BookmarkItem
+                bookmark={bookmark}
+                isDraggable={orderedBookmarks.length > 1}
+                isSorting={isSorting}
+                key={bookmark.id}
+                index={index}
+                selectedItem={selectedItem}
+                onSelect={onSelect}
+                onDeleteBookmark={onDeleteBookmark}
+              />
+            ))}
+          </ul>
+        </SortableContext>
+      </DndContext>
+    </CollapseSection>
+  );
+};
+
+// eslint-disable-next-line import/no-default-export -- deprecated usage
+export default BookmarkList;

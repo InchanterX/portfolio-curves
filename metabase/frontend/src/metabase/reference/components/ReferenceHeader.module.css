@@ -1,0 +1,28 @@
+:root {
+  --title-color: var(--mb-color-text-secondary);
+}
+
+.headerBody {
+  composes: textDark textBold from "style";
+  flex: 1 0 auto;
+  display: flex;
+  overflow: hidden;
+  align-items: center;
+  border-color: var(--mb-color-border-neutral);
+}
+
+.headerTextInput {
+  composes: p1 from "style";
+  font-size: 18px;
+  /* the surrounding .headerBody is bold; the field itself shouldn't inherit that */
+  font-weight: normal;
+  color: var(--title-color);
+  max-width: 550px;
+}
+
+.headerSchema {
+  composes: textSecondary from "style";
+  position: absolute;
+  top: -10px;
+  font-size: 12px;
+}

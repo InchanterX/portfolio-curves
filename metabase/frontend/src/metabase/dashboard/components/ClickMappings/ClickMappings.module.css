@@ -1,0 +1,9 @@
+.TargetTrigger {
+  border-radius: 0.5rem;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--mb-color-core-brand);
+    background-color: var(--mb-color-background_page-secondary);
+  }
+}

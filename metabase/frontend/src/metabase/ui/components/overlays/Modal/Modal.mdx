@@ -1,0 +1,139 @@
+import { useState } from "react";
+import { Canvas, Story, Meta } from "@storybook/blocks";
+import { Button, Flex, TextInput } from "metabase/ui";
+import { Modal } from "./";
+import * as ModalStories from "./Modal.stories";
+
+<Meta of={ModalStories} />
+
+# Modal
+
+Our themed wrapper around [Mantine Modal](https://v6.mantine.dev/core/modal/).
+
+## Docs
+
+- [Mantine Modal Docs](https://v6.mantine.dev/core/modal/)
+
+## Usage
+
+Pass the heading as `title` and put the action buttons in a `Modal.Footer` as the last child, so the title, body and buttons always get the same placement and spacing.
+
+```tsx
+<Modal title={t`Delete this database?`} opened={opened} onClose={onClose}>
+  <Text>{t`This can't be undone.`}</Text>
+  <Modal.Footer>
+    <Button onClick={onClose}>{t`Cancel`}</Button>
+    <Button variant="filled" color="negative">{t`Delete`}</Button>
+  </Modal.Footer>
+</Modal>
+```
+
+### Layouts
+
+- `layout="default"` left-aligns the title and body, and right-aligns the buttons.
+- `layout="centered"` centre-aligns everything, stacks the buttons with the primary one on top, and shows an optional `illustration` above the title. Body copy is centred too. To left-align it, pass `ta="start"` to its `Text` (or to the `Stack` that wraps it).
+
+Don't confuse `layout` with Mantine's `centered` prop, which sets the modal's vertical position in the viewport.
+
+<Canvas of={ModalStories.Overview} />
+
+### Density
+
+- `density="default"` leaves 16px below the title and above the buttons, and 12px between the buttons. Use it for confirmations, messages and single-input dialogs.
+- `density="relaxed"` leaves 24px below the title and above the buttons, and 16px between the buttons. Use it when the body is a form with several fields or is split into sections. Space the fields 24px apart (`Stack gap="xl"`) to match.
+
+<Canvas of={ModalStories.WithForm} />
+
+### Padding
+
+The `padding` prop only accepts `0`, for full-bleed modals that lay out their own contents, such as pickers and side sheets. Leave it out to get the standard padding.
+
+### Back button and header actions
+
+Pass `onBack` to show a Back button before the title. Clicking the title goes back too. Escape, the close button and clicking outside still close the modal, so a multi-step modal can be dismissed from any step.
+
+Pass `headerActions` for controls next to the close button, such as an icon button with a tooltip.
+
+```tsx
+<Modal
+  title={t`Static embedding`}
+  opened={opened}
+  headerActions={<ActionIcon aria-label={t`Edit`}>…</ActionIcon>}
+  onBack={onBack}
+  onClose={onClose}
+>
+```
+
+The `centered` layout doesn't support either prop.
+
+<Canvas of={ModalStories.BackButton} />
+
+### Custom layouts
+
+`Modal.Root`, `Modal.Overlay`, `Modal.Content`, `Modal.Header`, `Modal.Title`, `Modal.Heading`, `Modal.CloseButton` and `Modal.Body` are an escape hatch for modals that don't fit the standard structure, such as side sheets. Prefer the props above where you can.
+
+For a Back button in a custom header, use `Modal.Heading` in place of `Modal.Title` and pass it `onBack`. It renders the title with the same Back button as `Modal`, and takes a `subtitle` for text under the title.
+
+## Guidelines
+
+### Modal headings should be in sentence case.
+
+Sentence-case fits the friendly, casual personality of Metabase. This means it should be `Add to dashboard` instead of `Add To Dashboard` for example.
+
+<Canvas of={ModalStories.SentenceCaseTitles} />
+
+### Headings for confirmation modals should always be a question, and the body text should elaborate on the consequences
+
+E.g.,`Delete this database?` with body copy that contains clarifying information about what will happen if this action is taken, e.g., `This can't be undone, and questions that rely on this data will no longer work.`
+
+<Canvas of={ModalStories.Confirmation} />
+
+### Buttons should be right-aligned, with the primary action on the far right
+
+This is primarily to reinforce the top-left-to-bottom-right eye travel path for left-to-right language readers.
+
+(Research from [NN Group says it really doesn't matter that much](https://www.nngroup.com/articles/ok-cancel-or-cancel-ok/) which side the buttons align to, so this is mostly for consistency and convention.)
+
+### The primary button for create or neutral actions should be blue, and red for destructive actions
+
+- Examples of “create” and neutral actions:
+
+  - Save
+  - Create
+  - Invite
+  - Download
+  - Okay
+  - Done
+
+- Examples of “destructive” actions
+  - Discard
+  - Delete
+  - Deactivate
+  - Revoke
+  - Remove
+
+### The text for primary action buttons should always be a verb
+
+If the title of a modal is e.g., "Add this to a dashboard," the primary action should be `Add` instead of "Yes" for example.
+
+Or if we ask, "Reset this password?" the primary button should say `Reset`. This provides good additional confirmation to the user about what's going to happen if they click the button. Additionally, though we could write, "Yes, reset," that's unnecessarily verbose.
+
+### The secondary action should always say `Cancel` with rare exceptions
+
+This is for the sake of predictability, consistency, and convention.
+
+There are some rare exceptions, like when the modal is a confirmation or a followup from a previous modal. As an example, when you save a question, we ask you in a modal if you want to add it to a dashboard. In this case, saying "cancel" is ambiguous (does this cancel saving the card?), and it makes sense for it to read `Not now`
+
+### There should almost never be more than two buttons in a modal
+
+There are few legitimate cases where a modal should have more than two buttons. E.g., if there were a third action that says "learn more", clicking it might open a new window, but it leaves the modal in an ambiguous state.
+
+It’s okay for a modal to have only a single button. Here’s an example:
+
+<Canvas of={ModalStories.SingleButton} />
+
+### It’s okay if a modal doesn’t have body text
+
+Sometimes it’s not necessary. Here's a modal with a heading, but no body text.
+
+<Canvas of={ModalStories.NoBodyText} />

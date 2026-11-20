@@ -1,0 +1,293 @@
+(ns metabase.metabot.tools.document
+  "Document-generation specific tool wrappers."
+  (:require
+   [clojure.string :as str]
+   [metabase.metabot.query-execution :as query-execution]
+   [metabase.metabot.scope :as scope]
+   [metabase.metabot.table-utils :as table-utils]
+   [metabase.metabot.tools.construct :as construct-tools]
+   [metabase.metabot.tools.core :as tools]
+   [metabase.metabot.tools.error :as tools.error]
+   [metabase.metabot.tools.shared :as shared]
+   [metabase.metabot.tools.sql.common :as sql.common]
+   [metabase.metabot.tools.sql.create :as create-sql-query-tools]
+   [metabase.query-processor.core :as qp]
+   [metabase.query-processor.middleware.catch-exceptions :as qp.catch-exceptions]
+   [metabase.util.i18n :refer [tru]]
+   [metabase.warehouses.core :as warehouses]))
+
+(set! *warn-on-reflection* true)
+
+(def ^:private chart-type-enum
+  (into [:enum] shared/chart-types))
+
+(defn- parse-reference
+  [[k v]]
+  (let [reference (name k)]
+    (when-let [[_ reference-type reference-id] (re-matches #"([^:]+):(.+)" reference)]
+      {:reference reference
+       :type      reference-type
+       :id        reference-id
+       :name      v})))
+
+(defn- parse-int
+  [value]
+  (cond
+    (int? value) value
+    (and (string? value) (re-matches #"\d+" value)) (Integer/parseInt value)
+    :else nil))
+
+(defn- referenced-database-ids
+  [references]
+  (into []
+        (comp (map parse-reference)
+              (filter #(= "database" (:type %)))
+              (map (comp parse-int :id))
+              (remove nil?))
+        references))
+
+(def ^:private find-database-id-step
+  {:uses #{"list_available_data_sources"}
+   :text "Call `list_available_data_sources` and retry with the `database_id` of a model that holds the data."})
+
+(tools/defrecoverable no-database-chosen!
+  "The user did not `@`-mention a database, and the call did not set `database_id`."
+  {:payload [:map {:closed true}]}
+  [_]
+  {:message  "No database was `@`-mentioned, so set `database_id` to the database that holds the data."
+   :recovery [find-database-id-step]})
+
+(tools/defrecoverable unmentioned-database!
+  "The user `@`-mentioned several databases, and the call did not choose one of them."
+  {:payload [:map {:closed true} [:database-ids [:sequential :int]]]}
+  [{:keys [database-ids]}]
+  {:message  (str "The user `@`-mentioned databases " (str/join ", " database-ids)
+                  ". Set `database_id` to one of them.")
+   :recovery []})
+
+(tools/defrecoverable chosen-database-not-found!
+  "The database the call chose does not exist, or the current user can't read it.
+
+  Not `recoverable.common/unknown-database!`, because that error tells the model to call `document_schema_collect`,
+  which is the tool that failed here."
+  {:payload     [:map {:closed true} [:database-id :int]]
+   :status-code 404}
+  [{:keys [database-id]}]
+  {:message  (str "Database " database-id " was not found.")
+   :recovery [find-database-id-step]})
+
+(tools/defrecoverable chosen-database-without-sql-access!
+  "The current user can read the database the call chose, but can't write SQL against it, for example because the user
+  has only query builder access or a sandbox on it."
+  {:payload     [:map {:closed true} [:database-id :int]]
+   :status-code 403}
+  [{:keys [database-id]}]
+  {:message  (str "The user can't write SQL against database " database-id ".")
+   :recovery [find-database-id-step]})
+
+(defn- chosen-database-id
+  "Return the ID of the database to collect the schema of.
+
+  The user can choose the database with an `@` mention. The model chooses it with `database-id` when the user mentioned
+  no database, or chooses one of the databases that the user mentioned when there are several."
+  [mentioned-ids database-id]
+  (cond
+    (= 1 (count mentioned-ids))
+    (first mentioned-ids)
+
+    (some #{database-id} mentioned-ids)
+    database-id
+
+    (seq mentioned-ids)
+    (unmentioned-database! {:database-ids mentioned-ids})
+
+    (nil? database-id)
+    (no-database-chosen! {})
+
+    :else
+    database-id))
+
+(defn- chosen-database
+  "Return the database to collect the schema of. When the database doesn't exist or the current user can't read it,
+  throw an unrecoverable error, which ends the turn, if the user mentioned it, because only the user can mention another
+  one. Throw a recoverable error if the model chose it.
+
+  When the model chose the database, also throw a recoverable error if the current user can't write SQL against it.
+  `document_construct_sql_chart` makes the same check, but there a failure ends the turn."
+  [ctx database-id]
+  (let [references    (get-in (some-> (:memory-atom ctx) deref) [:context :references])
+        mentioned-ids (referenced-database-ids references)
+        database-id   (chosen-database-id mentioned-ids database-id)
+        db            (try
+                        (warehouses/get-database database-id)
+                        (catch clojure.lang.ExceptionInfo e
+                          (cond
+                            (not (contains? tools/refusal-status-codes (:status-code (ex-data e))))
+                            (throw e)
+
+                            (seq mentioned-ids)
+                            (tools/unrecoverable!
+                             ::database-unavailable
+                             {:user-message (tru "The database you mentioned wasn''t found, or you don''t have access to it.")
+                              :data         {:database-id database-id}
+                              :cause        e})
+
+                            :else
+                            (tools.error/throw-recoverable! ::chosen-database-not-found
+                                                            {:database-id database-id}
+                                                            {:cause e}))))]
+    (when-not (or (seq mentioned-ids)
+                  (sql.common/native-query-access? database-id))
+      (chosen-database-without-sql-access! {:database-id database-id}))
+    db))
+
+(def ^:private schema-collect-description
+  "Collects the schema of a database in order to construct a SQL query.
+
+  **Usage:**
+- Use this tool when the user is explicitly requesting to use SQL
+- Use this tool when an existing model or metric does not answer the user's question.
+- Do NOT use this tool if there is a model or metric that can answer the user's question
+  unless the user is requesting SQL.")
+
+(defrecord DocumentSchemaCollectTool []
+  tools/Tool
+  (declaration [_]
+    {:name                 "document_schema_collect"
+     :description          schema-collect-description
+     :scope                scope/agent-document-read
+     :metabot/capabilities #{:permission-write-sql-queries}
+     :args                 [:map {:closed true}
+                            [:database_id {:optional true} [:maybe [:int {:min 1}]]]]})
+  (handle [_ {:keys [database_id]} ctx]
+    (let [db          (chosen-database ctx database_id)
+          database-id (:id db)
+          schema-ddl  (table-utils/schema-full database-id)]
+      {:output            (str "<result>\n"
+                               "The database has this schema:\n"
+                               "<database_schema>\n"
+                               schema-ddl
+                               "\n</database_schema>\n"
+                               "</result>\n"
+                               "<instructions>\n"
+                               "NEXT: construct a SQL query based on the user's instructions and this schema.\n"
+                               "THEN: call `document_construct_sql_chart` with SQL and chart settings, passing "
+                               "database_id=" database-id " (the id of the database above).\n"
+                               "SQL engine: " (:engine db) ".\n"
+                               "</instructions>")
+       :structured-output {:database_id database-id
+                           :sql_engine  (:engine db)}})))
+
+(def document-schema-collect-tool
+  "The `document_schema_collect` tool."
+  (->DocumentSchemaCollectTool))
+
+(def ^:private sql-chart-schema
+  [:map {:closed true}
+   [:database_id :int]
+   [:name :string]
+   [:description :string]
+   [:analysis :string]
+   [:approach :string]
+   [:sql :string]
+   [:viz_settings [:map {:closed true}
+                   [:chart_type chart-type-enum]]]])
+
+(defn- without-stack-frames
+  "`message` up to the first stack frame in it, or `message` when it has none.
+
+    (without-stack-frames \"ERROR processing query\\n\\tat com.example.Client.run(Unknown Source)\")
+    ;; => \"ERROR processing query\""
+  [message]
+  ;; Some JDBC drivers, such as Databricks, put a stack trace in their error text.
+  ;; `qp.catch-exceptions/exception-response` cuts its `:error` at the same place.
+  (some-> message (str/split #"\n\tat " 2) first))
+
+(defn- check-query!
+  "Validate one row of `query`.
+
+  When the caller may see the failure, such as a database rejection, throw [[sql.common/query-failed!]] with its
+  message, less any stack frames a driver put in it. Rethrow any other failure, such as an app DB error, unchanged."
+  [query]
+  (try
+    (qp/process-query (assoc query :constraints {:max-results 1 :max-results-bare-rows 1}))
+    (catch Exception e
+      ;; The outer message, not `:error`: `:error` swaps in an inner exception's text, which can drop curated text
+      ;; such as the saturated-pool message, or the tag and question that a `{{#123}}` failure names.
+      (if (query-execution/caller-facing-failure? (qp.catch-exceptions/exception-response e))
+        (sql.common/query-failed! {:error-message (without-stack-frames (ex-message e))})
+        (throw e)))))
+
+(defrecord DocumentConstructSqlChartTool []
+  tools/Tool
+  (declaration [_]
+    {:name                 "document_construct_sql_chart"
+     :description          "Construct SQL-backed chart draft payload for document insertion."
+     :scope                scope/agent-document-create
+     :metabot/capabilities #{:permission-write-sql-queries}
+     :args                 sql-chart-schema})
+  (handle [_ {:keys [database_id name description analysis approach sql viz_settings]} _ctx]
+    ;; No table check: this tool drops warnings and runs the query, so the database reports a bad reference.
+    (let [{:keys [query-id query]} (sql.common/validated-sql-action!
+                                    (create-sql-query-tools/create-sql-query {:database-id   database_id
+                                                                              :sql           sql
+                                                                              :check-tables? false}))
+          chart-type (get viz_settings :chart_type)]
+      (check-query! query)
+      {:output            "Draft chart payload generated from SQL query."
+       :structured-output {:tool          "document_construct_sql_chart"
+                           :name          name
+                           :description   description
+                           :analysis      analysis
+                           :approach      approach
+                           :dataset_query query
+                           :display       chart-type
+                           :chart_type    chart-type
+                           :query_id      query-id
+                           :query         query
+                           :result-type   :chart-draft}})))
+
+(def document-construct-sql-chart-tool
+  "The `document_construct_sql_chart` tool."
+  (->DocumentConstructSqlChartTool))
+
+(def ^:private model-chart-schema
+  [:map {:closed true}
+   [:name :string]
+   [:description :string]
+   [:query construct-tools/LLMQueryArgument]
+   [:viz_settings [:map {:closed true}
+                   [:chart_type chart-type-enum]]]])
+
+(defrecord DocumentConstructModelChartTool []
+  tools/Tool
+  (declaration [_]
+    {:name        "document_construct_model_chart"
+     :description "Construct notebook/model-backed chart draft payload for document insertion."
+     :scope       scope/agent-document-create
+     :args        model-chart-schema})
+  (handle [_ {:keys [name description query viz_settings]} ctx]
+    (let [chart-type (get viz_settings :chart_type)
+          {query-id :query-id dataset-query :query repairs :repairs}
+          (:structured-output (tools/call construct-tools/construct-notebook-query-tool
+                                          {:query         query
+                                           :title         name
+                                           :description   description
+                                           :visualization {:chart_type chart-type}}
+                                          ctx))]
+      {:output            "Draft chart payload generated from model/notebook query."
+       :structured-output {:tool          "document_construct_model_chart"
+                           :name          name
+                           :description   description
+                           :dataset_query dataset-query
+                           :display       chart-type
+                           :chart_type    chart-type
+                           :query_id      query-id
+                           :query         dataset-query
+                           :result-type   :chart-draft
+                           ;; For the `agent_used_tool` event of this call, as in `construct_notebook_query`.
+                           :repairs       repairs}})))
+
+(def document-construct-model-chart-tool
+  "The `document_construct_model_chart` tool."
+  (->DocumentConstructModelChartTool))

@@ -1,0 +1,287 @@
+import userEvent from "@testing-library/user-event";
+
+import {
+  createMockMetadata,
+  createMockMetadataFromState,
+} from "__support__/metadata";
+import { createMockState } from "__support__/state";
+import { createMockEntitiesState } from "__support__/store";
+import { renderWithProviders, screen } from "__support__/ui";
+import * as Lib from "metabase-lib";
+import {
+  DEFAULT_TEST_QUERY,
+  SAMPLE_PROVIDER,
+  createMetadataProvider,
+} from "metabase-lib/test-helpers";
+import Question from "metabase-lib/v1/Question";
+import type { Card, Database, Table } from "metabase-types/api";
+import { createMockCard } from "metabase-types/api/mocks";
+import {
+  ORDERS_ID,
+  PRODUCTS_ID,
+  createOrdersTable,
+  createProductsTable,
+  createSampleDatabase,
+} from "metabase-types/api/mocks/presets";
+
+import { ViewOnlyTag } from "./ViewOnly";
+
+type SetupOpts = {
+  card: Card;
+  database?: Database;
+  tables?: Table[];
+  questions?: Card[];
+};
+
+function setup({
+  card,
+  tables,
+  database = createSampleDatabase(),
+  questions = [],
+}: SetupOpts) {
+  console.warn = jest.fn();
+
+  const storeInitialState = createMockState({
+    entities: createMockEntitiesState({
+      databases: [database],
+      questions: [...questions, card],
+      tables,
+    }),
+  });
+
+  const metadata = createMockMetadataFromState(storeInitialState);
+  const question = new Question(card, metadata);
+
+  renderWithProviders(
+    <div>
+      <ViewOnlyTag question={question} />
+    </div>,
+    {
+      storeInitialState,
+    },
+  );
+}
+
+async function expectNoPopover() {
+  await userEvent.hover(screen.getByText("View-only"));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+}
+
+async function expectPopoverToHaveText(text: string) {
+  await userEvent.hover(screen.getByText("View-only"));
+  const dialog = await screen.findByRole("dialog");
+  expect(dialog).toBeInTheDocument();
+  expect(dialog).toHaveTextContent(text);
+}
+
+const HIDDEN_VISIBILITY_TYPES = ["hidden", "technical", "cruft"] as const;
+
+const ORDERS_QUERY = (function () {
+  const query = Lib.createTestQuery(SAMPLE_PROVIDER, DEFAULT_TEST_QUERY);
+  const availableColumns = Lib.fieldableColumns(query, -1);
+  const columns = availableColumns.filter((column) => {
+    const info = Lib.displayInfo(query, -1, column);
+    return info.table?.name === "ORDERS" || info.table?.name === "PRODUCTS";
+  });
+
+  return Lib.withFields(query, -1, columns);
+})();
+
+const ORDERS_JOIN_PRODUCTS_QUERY = Lib.createTestQuery(SAMPLE_PROVIDER, {
+  stages: [
+    {
+      source: { type: "table", id: ORDERS_ID },
+      joins: [
+        {
+          source: { type: "table", id: PRODUCTS_ID },
+          strategy: "left-join",
+          conditions: [
+            {
+              operator: "=",
+              left: { type: "column", name: "ID" },
+              right: { type: "column", name: "ID" },
+            },
+          ],
+        },
+      ],
+    },
+  ],
+});
+
+const SOURCE_CARD_ID = 2;
+
+function createCardProvider(card: Card) {
+  return createMetadataProvider({
+    metadata: createMockMetadata({
+      databases: [createSampleDatabase()],
+      questions: [card],
+    }),
+  });
+}
+
+function createCardFromQuery({
+  query,
+  ...rest
+}: Partial<Card> & { query: Lib.Query }): Card {
+  return createMockCard({
+    ...rest,
+    dataset_query: Lib.toJsQuery(query),
+  });
+}
+
+describe("ViewOnlyTag", () => {
+  describe("cards", () => {
+    it("should show the View-only badge when the source card is inaccessible", async () => {
+      const sourceCard = createCardFromQuery({
+        id: SOURCE_CARD_ID,
+        query: Lib.createTestQuery(SAMPLE_PROVIDER, DEFAULT_TEST_QUERY),
+      });
+      const query = Lib.createTestQuery(createCardProvider(sourceCard), {
+        stages: [{ source: { type: "card", id: sourceCard.id } }],
+      });
+
+      setup({ card: createCardFromQuery({ query }) });
+
+      expect(screen.getByText("View-only")).toBeInTheDocument();
+      await expectNoPopover();
+    });
+
+    it("should show the View-only badge when a joined card is inaccessible", async () => {
+      const sourceCard = createCardFromQuery({
+        id: SOURCE_CARD_ID,
+        query: Lib.createTestQuery(SAMPLE_PROVIDER, {
+          stages: [{ source: { type: "table", id: PRODUCTS_ID } }],
+        }),
+      });
+      const query = Lib.createTestQuery(createCardProvider(sourceCard), {
+        stages: [
+          {
+            source: { type: "table", id: ORDERS_ID },
+            joins: [
+              {
+                source: { type: "card", id: sourceCard.id },
+                strategy: "left-join",
+                alias: "Orders Question",
+                conditions: [
+                  {
+                    operator: "=",
+                    left: { type: "column", name: "PRODUCT_ID" },
+                    right: { type: "column", name: "ID" },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      });
+
+      setup({ card: createCardFromQuery({ query }) });
+
+      expect(screen.getByText("View-only")).toBeInTheDocument();
+      await expectNoPopover();
+    });
+
+    it("should not show the View-only badge when the source card is accessible", () => {
+      const sourceCard = createCardFromQuery({
+        id: SOURCE_CARD_ID,
+        query: Lib.createTestQuery(SAMPLE_PROVIDER, {
+          stages: [{ source: { type: "table", id: ORDERS_ID } }],
+        }),
+      });
+      const query = Lib.createTestQuery(createCardProvider(sourceCard), {
+        stages: [{ source: { type: "card", id: sourceCard.id } }],
+      });
+      setup({
+        questions: [sourceCard],
+        card: createCardFromQuery({ query }),
+      });
+
+      expect(screen.queryByText("View-only")).not.toBeInTheDocument();
+    });
+
+    it("should not show the View-only badge when the joined card is accessible", () => {
+      const sourceCard = createCardFromQuery({
+        id: SOURCE_CARD_ID,
+        query: Lib.createTestQuery(SAMPLE_PROVIDER, {
+          stages: [{ source: { type: "table", id: PRODUCTS_ID } }],
+        }),
+      });
+      const query = Lib.createTestQuery(createCardProvider(sourceCard), {
+        stages: [
+          {
+            source: { type: "table", id: ORDERS_ID },
+            joins: [
+              {
+                source: { type: "card", id: sourceCard.id },
+                strategy: "left-join",
+                conditions: [
+                  {
+                    operator: "=",
+                    left: { type: "column", name: "PRODUCT_ID" },
+                    right: { type: "column", name: "ID" },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      });
+      setup({
+        questions: [sourceCard],
+        card: createCardFromQuery({ query }),
+      });
+
+      expect(screen.queryByText("View-only")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("tables", () => {
+    for (const visibility_type of HIDDEN_VISIBILITY_TYPES) {
+      it(`should show the View-only badge when the source table is ${visibility_type}`, async () => {
+        setup({
+          card: createCardFromQuery({ query: ORDERS_JOIN_PRODUCTS_QUERY }),
+          tables: [
+            createOrdersTable({ visibility_type }),
+            createProductsTable({ visibility_type: null }),
+          ],
+        });
+
+        expect(screen.getByText("View-only")).toBeInTheDocument();
+        await expectPopoverToHaveText(
+          "One of the administrators hid the source table “Orders”, making this question view-only.",
+        );
+      });
+
+      it(`should show the View-only badge when a joined table is ${visibility_type}`, async () => {
+        setup({
+          card: createCardFromQuery({ query: ORDERS_JOIN_PRODUCTS_QUERY }),
+          tables: [
+            createOrdersTable({ visibility_type: null }),
+            createProductsTable({ visibility_type }),
+          ],
+        });
+
+        expect(screen.getByText("View-only")).toBeInTheDocument();
+        await expectPopoverToHaveText(
+          "One of the administrators hid the source table “Products”, making this question view-only.",
+        );
+      });
+    }
+  });
+
+  describe("implicit joins", () => {
+    for (const visibility_type of HIDDEN_VISIBILITY_TYPES) {
+      it(`should not show the View-only badge when an implicitly joined table is ${visibility_type}`, async () => {
+        setup({
+          card: createCardFromQuery({ query: ORDERS_QUERY }),
+          tables: [
+            createOrdersTable({ visibility_type: null }),
+            createProductsTable({ visibility_type }),
+          ],
+        });
+
+        expect(screen.queryByText("View-only")).not.toBeInTheDocument();
+      });
+    }
+  });
+});

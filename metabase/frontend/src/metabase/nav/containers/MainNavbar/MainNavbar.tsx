@@ -1,0 +1,167 @@
+import { useEffect, useMemo } from "react";
+
+import {
+  skipToken,
+  useGetCardQuery,
+  useGetCollectionQuery,
+} from "metabase/api";
+import { useQuestionFromCard } from "metabase/metadata-store";
+import { NavbarPromoSlot } from "metabase/nav/components/NavbarPromoSlot";
+import { connect } from "metabase/redux";
+import { closeNavbar, openNavbar } from "metabase/redux/app";
+import type { State } from "metabase/redux/store";
+import { useNavigate } from "metabase/router";
+import { Flex } from "metabase/ui";
+import * as Urls from "metabase/urls";
+import type Question from "metabase-lib/v1/Question";
+import type { CollectionId } from "metabase-types/api";
+
+import S from "./MainNavbar.module.css";
+import MainNavbarContainer from "./MainNavbarContainer";
+import { Sidebar } from "./Sidebar";
+import {
+  getSelectedItems,
+  isCollectionPath,
+  isMetricPath,
+  isModelPath,
+  isQuestionPath,
+} from "./getSelectedItems";
+import type {
+  MainNavbarDispatchProps,
+  MainNavbarOwnProps,
+  SelectedItem,
+} from "./types";
+
+interface EntityLoaderProps {
+  question?: Question;
+}
+
+interface StateProps {
+  questionId?: number | null;
+  collectionId?: CollectionId | null;
+}
+
+type Props = MainNavbarOwnProps &
+  EntityLoaderProps &
+  StateProps &
+  MainNavbarDispatchProps;
+
+function mapStateToProps(state: State, props: MainNavbarOwnProps) {
+  return {
+    questionId: maybeGetQuestionId(state, props),
+    collectionId: maybeGetCollectionId(state, props),
+  };
+}
+
+const mapDispatchToProps = {
+  openNavbar,
+  closeNavbar,
+};
+
+function MainNavbarInner({
+  isOpen,
+  location,
+  params,
+  questionId,
+  collectionId,
+  dashboard,
+  openNavbar,
+  closeNavbar,
+  ...props
+}: Props) {
+  const navigate = useNavigate();
+  const { currentData: card } = useGetCardQuery(
+    questionId
+      ? {
+          id: questionId,
+        }
+      : skipToken,
+  );
+
+  const { currentData: collection } = useGetCollectionQuery(
+    collectionId ? { id: collectionId } : skipToken,
+  );
+
+  useEffect(() => {
+    function handleSidebarKeyboardShortcut(e: KeyboardEvent) {
+      if (e.key === "." && (e.ctrlKey || e.metaKey)) {
+        if (isOpen) {
+          closeNavbar();
+        } else {
+          openNavbar();
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleSidebarKeyboardShortcut);
+    return () => {
+      window.removeEventListener("keydown", handleSidebarKeyboardShortcut);
+    };
+  }, [isOpen, openNavbar, closeNavbar]);
+
+  const question = useQuestionFromCard(card);
+  const selectedItems = useMemo<SelectedItem[]>(() => {
+    return getSelectedItems({
+      pathname: location.pathname,
+      params,
+      question,
+      collection,
+      dashboard,
+    });
+  }, [location, params, question, dashboard, collection]);
+
+  return (
+    <Sidebar
+      isOpen={isOpen}
+      side="left"
+      aria-hidden={!isOpen}
+      data-testid="main-navbar-root"
+      data-element-id="navbar-root"
+    >
+      <Flex
+        component="nav"
+        className={S.nav}
+        direction="column"
+        pt="sm"
+        h="100%"
+      >
+        <MainNavbarContainer
+          isOpen={isOpen}
+          location={location}
+          params={params}
+          selectedItems={selectedItems}
+          openNavbar={openNavbar}
+          closeNavbar={closeNavbar}
+          onChangeLocation={navigate}
+          {...props}
+        />
+        <NavbarPromoSlot />
+      </Flex>
+    </Sidebar>
+  );
+}
+
+function maybeGetQuestionId(
+  state: State,
+  { location, params }: MainNavbarOwnProps,
+) {
+  const { pathname } = location;
+  const canFetchCard =
+    isQuestionPath(pathname) || isModelPath(pathname) || isMetricPath(pathname);
+  const cardId = isMetricPath(pathname) ? params.cardId : params.slug;
+  return canFetchCard ? Urls.extractEntityId(cardId) : null;
+}
+
+function maybeGetCollectionId(
+  state: State,
+  { location, params }: MainNavbarOwnProps,
+) {
+  const { pathname } = location;
+  const canFetchQuestion = isCollectionPath(pathname);
+  return canFetchQuestion ? Urls.extractEntityId(params.slug) : null;
+}
+
+export const MainNavbar = connect(
+  mapStateToProps,
+  mapDispatchToProps,
+)(MainNavbarInner);

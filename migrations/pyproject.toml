@@ -1,0 +1,28 @@
+[project]
+name = "curves-migrations"
+version = "0.1.0"
+requires-python = ">=3.14,<3.15"
+dependencies = ["alembic>=1.17,<2", "sqlalchemy>=2.0,<3", "psycopg[binary]>=3.3,<4"]
+
+[project.scripts]
+curves-migrate = "curves_migrations.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/curves_migrations"]
+
+[dependency-groups]
+dev = ["ruff>=0.14", "pytest>=8.4,<10"]
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires a disposable PostgreSQL 18.6 database"]

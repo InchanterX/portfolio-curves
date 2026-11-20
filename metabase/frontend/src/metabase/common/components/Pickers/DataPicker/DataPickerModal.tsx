@@ -1,0 +1,119 @@
+import { useCallback, useMemo } from "react";
+
+import { useSetting } from "metabase/settings";
+import type {
+  DatabaseId,
+  RecentContexts,
+  SearchRequest,
+} from "metabase-types/api";
+
+import type {
+  EntityPickerOptions,
+  OmniPickerItem,
+  OmniPickerQuestionItem,
+  OmniPickerTableItem,
+  OmniPickerValue,
+} from "../EntityPicker";
+import { EntityPickerModal } from "../EntityPicker";
+
+import type { DataPickerValue } from "./types";
+import { isDataPickerValue } from "./types";
+import { getItemNotInDbTooltip, shouldDisableItemNotInDb } from "./utils";
+
+interface Props {
+  title: string;
+  value?: OmniPickerValue;
+  models?: DataPickerValue["model"][];
+  onChange: (item: OmniPickerTableItem | OmniPickerQuestionItem) => void;
+  onClose: () => void;
+  onlyDatabaseId?: DatabaseId;
+  shouldDisableItem?: (item: OmniPickerItem) => boolean;
+  options?: EntityPickerOptions;
+}
+
+const DATA_PICKER_MODELS: DataPickerValue["model"][] = [
+  "card",
+  "dataset",
+  "metric",
+  "table",
+];
+
+const RECENTS_CONTEXT: RecentContexts[] = ["selections"];
+
+export const DataPickerModal = ({
+  title,
+  value,
+  onChange,
+  onClose,
+  onlyDatabaseId,
+  shouldDisableItem,
+  options: passedOptions,
+  models: passedModels = DATA_PICKER_MODELS,
+}: Props) => {
+  const hasNestedQueriesEnabled = useSetting("enable-nested-queries");
+
+  const models: DataPickerValue["model"][] = useMemo(
+    () => (hasNestedQueriesEnabled ? passedModels : ["table"]),
+    [hasNestedQueriesEnabled, passedModels],
+  );
+
+  const searchParams: Partial<SearchRequest> = useMemo(() => {
+    const tableParams = onlyDatabaseId
+      ? { table_db_id: onlyDatabaseId }
+      : undefined;
+    return {
+      include_dashboard_questions: true,
+      filter_items_in_personal_collection: "exclude-others",
+      ...tableParams,
+    };
+  }, [onlyDatabaseId]);
+
+  const shouldDisable = useMemo(() => {
+    const shouldDisableFn = shouldDisableItemNotInDb(onlyDatabaseId);
+
+    return (i: OmniPickerItem) =>
+      shouldDisableFn(i) || Boolean(shouldDisableItem && shouldDisableItem(i));
+  }, [onlyDatabaseId, shouldDisableItem]);
+
+  const getItemTooltip = useMemo(() => {
+    const getNotInDbTooltip = getItemNotInDbTooltip(onlyDatabaseId);
+    return (item: OmniPickerItem): string | undefined =>
+      passedOptions?.getItemTooltip?.(item) ?? getNotInDbTooltip(item);
+  }, [onlyDatabaseId, passedOptions]);
+
+  const handleItemSelect = useCallback(
+    (item: OmniPickerItem) => {
+      if (!isDataPickerValue(item)) {
+        return;
+      }
+
+      onChange(item);
+      onClose();
+    },
+    [onChange, onClose],
+  );
+
+  return (
+    <EntityPickerModal
+      models={models}
+      value={value}
+      options={{
+        hasSearch: true,
+        hasRecents: true,
+        hasLibrary: true,
+        hasDatabases: true,
+        hasRootCollection: true,
+        hasConfirmButtons: false,
+        hasPersonalCollections: true,
+        ...passedOptions,
+        getItemTooltip,
+      }}
+      recentsContext={RECENTS_CONTEXT}
+      searchParams={searchParams}
+      title={title}
+      onClose={onClose}
+      onChange={handleItemSelect}
+      isDisabledItem={shouldDisable}
+    />
+  );
+};

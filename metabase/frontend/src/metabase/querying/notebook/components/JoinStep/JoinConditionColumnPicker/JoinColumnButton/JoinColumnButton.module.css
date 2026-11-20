@@ -1,0 +1,58 @@
+.joinCellItem {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  transition:
+    background 300ms linear,
+    border 300ms linear,
+    color 300ms linear;
+  cursor: pointer;
+
+  &.isReadOnly {
+    cursor: default;
+  }
+
+  &.hasColumnStyle {
+    min-height: 39px;
+    padding: 8px 10px 6px 10px;
+    border-radius: 6px;
+    background-color: var(--mb-color-background_surface-brand-strong);
+
+    &.isOpen {
+      background-color: var(--mb-color-background_surface-brand-strong-hover);
+    }
+
+    &:hover,
+    &:focus {
+      background-color: var(--mb-color-background_surface-brand-strong-hover);
+    }
+  }
+
+  &.noColumnStyle {
+    --no-column-style-alpha-color: color-mix(
+      in srgb,
+      var(--mb-color-text-brand-strong),
+      white 45%
+    );
+
+    min-height: 34px;
+    padding: 5px 20px;
+    color: var(--no-column-style-alpha-color);
+    border: 2px solid var(--no-column-style-alpha-color);
+    border-radius: 4px;
+
+    &.isOpen {
+      border-color: var(--mb-color-text-brand-strong);
+    }
+
+    &:hover,
+    &:focus {
+      border-color: var(--mb-color-text-brand-strong);
+    }
+  }
+}
+
+.joinCellContent {
+  word-break: break-word;
+}

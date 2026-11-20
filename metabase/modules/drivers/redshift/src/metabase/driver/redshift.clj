@@ -1,0 +1,1659 @@
+(ns metabase.driver.redshift
+  "Amazon Redshift Driver."
+  (:require
+   [clojure.java.jdbc :as jdbc]
+   [clojure.string :as str]
+   [honey.sql :as sql]
+   [java-time.api :as t]
+   [medley.core :as m]
+   [metabase.driver :as driver]
+   [metabase.driver-api.core :as driver-api]
+   [metabase.driver.common :as driver.common]
+   [metabase.driver.connection :as driver.conn]
+   [metabase.driver.postgres :as driver.postgres]
+   [metabase.driver.sql :as driver.sql]
+   [metabase.driver.sql-jdbc :as sql-jdbc]
+   [metabase.driver.sql-jdbc.common :as sql-jdbc.common]
+   [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+   [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
+   [metabase.driver.sql-jdbc.execute.legacy-impl :as sql-jdbc.legacy]
+   [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
+   [metabase.driver.sql-jdbc.sync.describe-database :as sql-jdbc.describe-database]
+   [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.driver.sql.util :as sql.u]
+   [metabase.driver.sync :as driver.s]
+   [metabase.driver.util :as driver.u]
+   [metabase.util :as u]
+   [metabase.util.date-2 :as u.date]
+   [metabase.util.honey-sql-2 :as h2x]
+   [metabase.util.i18n :refer [deferred-tru]]
+   [metabase.util.json :as json]
+   [metabase.util.log :as log]
+   [metabase.util.match :as match]
+   [metabase.util.performance :as perf])
+  (:import
+   (com.amazon.redshift.util RedshiftInterval)
+   (java.sql
+    Connection
+    PreparedStatement
+    ResultSet
+    ResultSetMetaData
+    Statement
+    Types)))
+
+(set! *warn-on-reflection* true)
+
+;; `::like-escape-char-built-in/like-escape-char-built-in` is inherited transitively via
+;; `:postgres` (see `metabase.driver.postgres`).
+(driver/register! :redshift, :parent :postgres)
+
+(defmethod driver/host-carrying-parameters :redshift
+  [_driver]
+  ["host" "PGHOST" "endpointurl" "stsendpointurl"])
+
+(defmethod driver/non-host-parameters :redshift
+  [_driver]
+  ["assumeminserverversion" "hostrecheckseconds" "isserverless" "kerberosservername" "loadbalancehosts"
+   "logservererrordetail" "serverlessacctid" "serverlessworkgroup" "sslhostnameverifier" "targetservertype"])
+
+(defmethod driver/disallowed-connection-parameters :redshift
+  [driver]
+  (into ((get-method driver/disallowed-connection-parameters :postgres) driver)
+        [;; Loads connection properties from a server-side profile, which can set any of these
+         "AuthProfile"
+         ;; Loads connection properties from a local file
+         "IniFile"
+         ;; Can pick a profile from the host's AWS config files
+         "Profile"
+         ;; Instantiates an arbitrary class (an IAM credentials provider)
+         "plugin_name"
+         ;; Writes the driver log to a chosen local directory
+         "LogPath"]))
+
+(doseq [[feature supported?] {:atomic-renames                   true
+                              :connection-impersonation         true
+                              :database-routing                 true
+                              :describe-default-expr            false
+                              :describe-fields                  true
+                              :describe-is-generated            false
+                              :describe-is-nullable             false
+                              :expression-literals              true
+                              :identifiers-with-spaces          false
+                              ;; Redshift has no secondary indexes; sortkeys are inlined into the table-creation
+                              ;; statement, not created afterwards. Override the `:postgres`-inherited standalone
+                              ;; support.
+                              :index/fetch                      true
+                              :index/inline-create              true
+                              :index/standalone-create          false
+                              ;; A capped query left a data-test run's transaction aborted; see `:jdbc/set-max-rows`.
+                              :jdbc/set-max-rows                false
+                              :metadata/table-existence-check   true
+                              :nested-field-columns             false
+                              :regex/lookaheads-and-lookbehinds false
+                              :rename                           true
+                              :test/jvm-timezone-setting        false
+                              ;; This driver reports inaccurate `:rows-affected` counts; the transforms layer
+                              ;; falls back to a native `COUNT(*)` on the CTAS path.
+                              ;; TODO: fix `execute-raw-queries!` to return accurate row counts for DDL
+                              ;; statements by using a different driver-native API for affected-row counts.
+                              :transforms/accurate-rows-affected false
+                              :transforms/python                true
+                              :transforms/table                 true
+                              :transforms/testing               true
+                              :transforms/index-ddl             false
+                              :uuid-type                        false
+                              :workspace                        true}]
+  (defmethod driver/database-supports? [:redshift feature] [_driver _feat _db] supported?))
+
+(defmethod driver/qualified-name-components :redshift
+  [_driver]
+  ;; Redshift emits `schema.table` (Postgres-style 2-part) in compiled SQL.
+  ;; Cross-database queries use external schemas, not `db.schema.table`.
+  [:schema])
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                             metabase.driver impls                                              |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defn- remove-duplicate-fields
+  "Redshift views can have duplicate column names, but when these columns appear in a query
+   they produce an ambiguous column error. To avoid this remove all duplicate columns"
+  [fields]
+  (let [field-key      (fn [f] (perf/select-keys f [:table-schema :table-name :name]))
+        key-counts     (frequencies (map field-key fields))
+        duplicate-keys (into #{} (keep (fn [[k cnt]] (when (> cnt 1) k)) key-counts))]
+    (doseq [{:keys [table-schema table-name name]} duplicate-keys]
+      (log/warnf "Duplicate column '%s' in %s.%s - skipping all occurrences"
+                 name table-schema table-name))
+    (remove #(contains? duplicate-keys (field-key %)) fields)))
+
+(defmethod sql-jdbc.sync/describe-fields-pre-process-xf :redshift
+  [_driver _db & _args]
+  ;; `describe-fields-sql` orders by [table-schema table-name database-position], so each table's columns arrive
+  ;; contiguously. A duplicate-column key is (table-schema, table-name, name) -- by definition all its occurrences are
+  ;; within a single table -- so we can dedup per table with `partition-by` rather than buffering the entire result
+  ;; set. This bounds memory to one table's columns (the per-table streaming contract) and is otherwise identical to a
+  ;; global dedup.
+  (comp (partition-by (juxt :table-schema :table-name))
+        (mapcat remove-duplicate-fields)))
+
+;; Skip the postgres implementation  as it has to handle custom enums which redshift doesn't support.
+(defmethod driver/dynamic-database-types-lookup :redshift
+  [driver database database-types]
+  ((get-method driver/dynamic-database-types-lookup :sql-jdbc) driver database database-types))
+
+(def ^:private regex-metacharacters
+  "Characters [[metabase.driver.sync/schema-pattern->re-pattern]] can turn into something other than themselves.
+
+  It compiles a filter segment into a regex by expanding an unescaped `*` into `.*` and handing every other
+  character to [[re-pattern]] as regex source. A segment containing none of these therefore compiles to a regex that
+  matches itself and nothing else, which is what lets an `in (...)` predicate select the schemas the client-side
+  filter would have kept.
+
+  Stray `]` and `}` are literals to Java and could be admitted; they are refused anyway rather than resting on that.
+
+  [[metabase.driver.redshift-test/exactly-named-schemas-agrees-with-filter-test]] pins the agreement, and
+  [[metabase.driver.redshift-test/regex-metacharacters-is-complete-test]] pins this set against every ASCII
+  character."
+  (set "\\.[]{}()*+?^$|"))
+
+(defn- exactly-named-schemas
+  "The schema names an inclusion filter names outright, or `nil` when evaluating the filter needs every schema.
+
+  Only a segment free of [[regex-metacharacters]] qualifies: one that carries regex syntax asks a different question
+  than `in (...)` does, and answering it needs every schema. Blank patterns mean \"include everything\", so they fall
+  through to the unfiltered query too."
+  [inclusion-patterns]
+  (when-not (str/blank? inclusion-patterns)
+    (let [segments (map str/trim (str/split inclusion-patterns #","))]
+      (when (perf/every? #(and (seq %) (not-any? regex-metacharacters %)) segments)
+        (distinct segments)))))
+
+(defn- get-tables-sql
+  "Query listing every syncable relation, restricted to `schema-names` when the filter named them outright.
+
+  Without that restriction this scans the whole catalog and the caller drops what the filter rejects. On a shared
+  cluster that is most of the rows -- CI runs measured ~1100 relations fetched to keep ~10."
+  [schema-names]
+  ;; Cal 2024-04-09 This query uses tables that the JDBC redshift driver currently uses.
+  ;; It does not return tables from datashares, which is a relatively new feature of redshift.
+  ;; See https://github.com/dbt-labs/dbt-redshift/issues/742 for an implementation for DBT's integration with redshift
+  ;; for inspiration, and the JDBC driver itself:
+  ;; https://github.com/aws/amazon-redshift-jdbc-driver/blob/master/src/main/java/com/amazon/redshift/jdbc/RedshiftDatabaseMetaData.java#L1794
+  (let [placeholders (when (seq schema-names)
+                       (str "(" (str/join ", " (repeat (count schema-names) "?")) ")"))]
+    (into
+     [(str/join
+       "\n"
+       (remove
+        nil?
+        ;; The two per-relation privilege calls live in the outer select list, not the `where`, and the caller
+        ;; drops rows where `selectable` is false. In a `where` the planner hoists them above the schema filter
+        ;; and evaluates them across the whole catalog: `has_any_column_privilege` alone then costs ~10s on a
+        ;; shared cluster, flat in how many relations survive. A select-list expression is computed only on rows
+        ;; that already passed the `where`, so the same calls cost nothing measurable. Filtering on `selectable`
+        ;; in SQL instead of in the caller puts the expression back in a predicate and brings the whole cost
+        ;; back -- measured, not assumed.
+        ["select"
+         "  s.name,"
+         "  s.schema,"
+         "  s.type,"
+         "  s.description,"
+         "  pg_catalog.has_table_privilege(s.oid, 'SELECT')"
+         "    or pg_catalog.has_any_column_privilege(s.oid, 'SELECT') as selectable"
+         "from ("
+         "  select"
+         "    c.oid,"
+         "    c.relname as name,"
+         "    n.nspname as schema,"
+         "    case c.relkind"
+         "      when 'r' then 'table'"
+         "      when 'p' then 'partitioned table'"
+         "      when 'v' then 'view'"
+         "      when 'f' then 'foreign table'"
+         "      when 'm' then 'materialized view'"
+         "      end as type,"
+         "    d.description"
+         "  from pg_catalog.pg_namespace n, pg_catalog.pg_class c"
+         "  left join pg_catalog.pg_description d on c.oid = d.objoid and d.objsubid = 0"
+         "  left join pg_catalog.pg_class dc on d.classoid=dc.oid and dc.relname='pg_class'"
+         "  left join pg_catalog.pg_namespace dn on dn.oid=dc.relnamespace and dn.nspname='pg_catalog'"
+         "  where c.relnamespace = n.oid"
+         "    and n.nspname !~ '^information_schema|catalog_history|pg_|metabase_cache_'"
+         "    and c.relkind in ('r', 'p', 'v', 'f', 'm')"
+         (when placeholders (str "    and n.nspname in " placeholders))
+         ;; per-schema, so cheap enough to stay a predicate
+         "    and pg_catalog.has_schema_privilege(n.oid, 'USAGE')"
+         ") s"
+         "union all"
+         "select"
+         "  tablename as name,"
+         "  schemaname as schema,"
+         "  'EXTERNAL TABLE' as type,"
+         ;; external tables don't have descriptions
+         "  null as description,"
+         ;; the USAGE predicate below is this branch's whole privilege test
+         "  true as selectable"
+         "from svv_external_tables t"
+         "where schemaname !~ '^information_schema|catalog_history|pg_|metabase_cache_'"
+         (when placeholders (str "  and t.schemaname in " placeholders))
+         ;; for external tables, USAGE privileges on a schema is sufficient to select
+         "  and pg_catalog.has_schema_privilege(t.schemaname, 'USAGE')"]))]
+     ;; once per union branch
+     (concat schema-names schema-names))))
+
+(defn- describe-database-tables
+  [database]
+  (let [[inclusion-patterns
+         exclusion-patterns] (driver.s/db-details->schema-filter-patterns database)
+        syncable? (fn [schema]
+                    (sql-jdbc.describe-database/include-schema-logging-exclusion inclusion-patterns exclusion-patterns schema))]
+    (eduction
+     ;; `selectable` is filtered here rather than in the SQL on purpose; `get-tables-sql` says why. `true?` rather
+     ;; than truthiness so that a driver someday handing back the string "false" fails closed.
+     ;;
+     ;; `syncable?` is kept over the narrowed query too: it stays the definition of what syncs, and an exclusion
+     ;; filter still arrives here with every schema.
+     (comp (filter (comp true? :selectable))
+           (filter (comp syncable? :schema))
+           (map #(dissoc % :type :selectable)))
+     (sql-jdbc.execute/reducible-query database (get-tables-sql (exactly-named-schemas inclusion-patterns))))))
+
+(defmethod driver/describe-database* :redshift
+  [driver database]
+  ;; TODO: change this to return a reducible so we don't have to hold 100k tables in memory in a set like this
+  ;;
+  ;; Redshift sync is super duper flaky and un-robust! This auto-retry is a temporary workaround until we can actually
+  ;; fix #45874
+  (try
+    (u/auto-retry (if driver-api/is-prod? 2 5)
+      (try
+        {:tables (into #{} (describe-database-tables database))}
+        (catch Throwable e
+          ;; during test/REPL runs, wait a second before throwing the exception, that way when we do our retry there is
+          ;; a better chance of it succeeding.
+          (when-not driver-api/is-prod?
+            (Thread/sleep 1000))
+          (throw e))))
+    (catch Throwable e
+      (throw (ex-info (format "Error in %s describe-database: %s" driver (ex-message e))
+                      {}
+                      e)))))
+
+(defmethod sql-jdbc.sync/describe-fields-sql :redshift
+  ;; The implementation is based on `getColumns` in https://github.com/aws/amazon-redshift-jdbc-driver/blob/master/src/main/java/com/amazon/redshift/jdbc/RedshiftDatabaseMetaData.java
+  ;; The `database-is-auto-increment` and `database-required` columns are currently missing because they are only
+  ;; needed for actions, which redshift doesn't support yet.
+  [driver & {:keys [schema-names table-names]}]
+  (sql/format {:select [[:c.column_name :name]
+                        [:c.data_type :database-type]
+                        [[:- :c.ordinal_position [:inline 1]] :database-position]
+                        [:c.table_schema :table-schema]
+                        [:c.table_name :table-name]
+                        [[:not= :pk.column_name nil] :pk?]
+                        [[:case [:not= :c.remarks [:inline ""]] :c.remarks :else nil] :field-comment]]
+               ;; svv_columns excludes columns from datashares, unlike svv_all_columns with includes them
+               :from [[:svv_columns :c]]
+               :left-join [[{:select [:tc.table_schema
+                                      :tc.table_name
+                                      :kc.column_name]
+                             :from [[:information_schema.table_constraints :tc]]
+                             :join [[:information_schema.key_column_usage :kc]
+                                    [:and
+                                     [:= :tc.constraint_name :kc.constraint_name]
+                                     [:= :tc.table_schema :kc.table_schema]
+                                     [:= :tc.table_name :kc.table_name]]]
+                             :where [:= :tc.constraint_type [:inline "PRIMARY KEY"]]}
+                            :pk]
+                           [:and
+                            [:= :c.table_schema :pk.table_schema]
+                            [:= :c.table_name :pk.table_name]
+                            [:= :c.column_name :pk.column_name]]]
+               :where [:and
+                       [:raw "c.table_schema !~ '^information_schema|catalog_history|pg_'"]
+                       (when schema-names [:in :c.table_schema (map u/lower-case-en schema-names)])
+                       (when table-names [:in :c.table_name (map u/lower-case-en table-names)])]
+               :order-by [:table-schema :table-name :database-position]}
+              :dialect (sql.qp/quote-style driver)))
+
+(defmethod driver/db-start-of-week :redshift
+  [_]
+  :sunday)
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                          Indexes (Index Manager)                                               |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defmethod driver/supported-index-methods :redshift
+  [_driver _database]
+  ;; Redshift has no secondary indexes: a sortkey and a distribution style are inlined into the table at creation.
+  ;; That's the CTAS for a SQL transform and the CREATE TABLE for a Python transform, so both are rendered in
+  ;; `compile-transform` and `create-table!`.
+  {:sortkey {:lifecycle    :inline
+             :display-name (deferred-tru "Sort key")
+             :fields       [driver.common/index-columns-field
+                            {:name         "style"
+                             :display-name (deferred-tru "Style")
+                             :type         :select
+                             :required     true
+                             :options      [{:name (deferred-tru "Compound")    :value "compound"}
+                                            {:name (deferred-tru "Interleaved") :value "interleaved"}]}]}
+   :distkey {:lifecycle    :inline
+             :display-name (deferred-tru "Distribution key")
+             :fields       [{:name         "style"
+                             :display-name (deferred-tru "Style")
+                             :type         :select
+                             :required     true
+                             ;; AUTO is Redshift's default and drifts over time, so it's not offered as a managed style;
+                             ;; an AUTO table still surfaces its current style as a (non-managed) index.
+                             :options      [{:name (deferred-tru "Key")  :value "key"}
+                                            {:name (deferred-tru "All")  :value "all"}
+                                            {:name (deferred-tru "Even") :value "even"}]}
+                            ;; only the :key style takes a column, so this is not required
+                            {:name         "columns"
+                             :display-name (deferred-tru "Columns")
+                             :type         :columns}]}})
+
+(defn- sortkey-clause
+  "Render the inline sortkey clause for a table's `indexes`, e.g. `COMPOUND SORTKEY (\"a\", \"b\")`, or nil when there
+  is no sortkey."
+  [driver indexes]
+  (when-let [{:keys [style columns]} (first (filter (comp #{:sortkey} :kind) indexes))]
+    (let [style-sql (if (= style :interleaved) "INTERLEAVED" "COMPOUND")
+          cols      (str/join ", " (map #(sql.u/quote-name driver :field (:name %)) columns))]
+      (format "%s SORTKEY (%s)" style-sql cols))))
+
+(defn- distkey-clause
+  "Render the inline distribution clause for a table's `indexes`, e.g. `DISTSTYLE KEY DISTKEY (\"a\")` or
+  `DISTSTYLE ALL`, or nil when there is no distkey."
+  [driver indexes]
+  (when-let [{:keys [style columns]} (first (filter (comp #{:distkey} :kind) indexes))]
+    (if (= style :key)
+      (format "DISTSTYLE KEY DISTKEY (%s)" (sql.u/quote-name driver :field (:name (first columns))))
+      (format "DISTSTYLE %s" (u/upper-case-en (name style))))))
+
+(defn- table-attributes-clause
+  "Render the inline Redshift table attributes (distribution then sort key) for `indexes`, in the order Redshift
+  requires, or nil when there are none. Shared by both creation seams: the CTAS in `compile-transform` and the
+  CREATE TABLE in `create-table!`."
+  [driver indexes]
+  (let [clauses (remove nil? [(distkey-clause driver indexes) (sortkey-clause driver indexes)])]
+    (when (seq clauses)
+      (str/join " " clauses))))
+
+(defn- distkey-index
+  "The distkey entry from a table's declared `reldiststyle` (0 EVEN, 1 KEY, 8 ALL) and KEY column; nil for AUTO (9) and
+  anything else. Reads the declared style, not the effective one Redshift drifts AUTO tables toward."
+  [reldiststyle key-column]
+  (when-let [style (case (long reldiststyle) 0 "even", 1 "key", 8 "all", nil)]
+    (let [key? (= style "key")]
+      {:name              nil
+       :kind              :distkey
+       :access-method     style
+       :is-unique         false
+       :is-primary        false
+       :is-valid          true
+       :key-columns       (if key? [key-column] [])
+       :include-columns   []
+       :partial-predicate nil
+       :definition        (if key?
+                            (format "DISTSTYLE KEY DISTKEY (%s)" key-column)
+                            (format "DISTSTYLE %s" (u/upper-case-en style)))})))
+
+;; Redshift has no secondary indexes; the only physical "indexes" are the inline unnamed sortkey and the distribution,
+;; so we override the inherited Postgres `pg_index` query. `svv_redshift_columns.sortkey` is the 1-based position
+;; (negative marks the whole key INTERLEAVED); `distkey` is true on the single KEY column. The declared distribution
+;; style comes from `pg_class_info`, which reports it for empty tables (`svv_table_info` doesn't). Blank `schema`
+;; falls back to `current_schema()`.
+(defmethod driver/fetch-table-indexes :redshift
+  [_driver database schema table]
+  (let [spec      (sql-jdbc.conn/db->pooled-connection-spec database)
+        rows      (jdbc/query
+                   spec
+                   [(str "SELECT column_name, sortkey, distkey FROM svv_redshift_columns "
+                         "WHERE schema_name = COALESCE(?, current_schema()) AND table_name = ? "
+                         "ORDER BY abs(sortkey)")
+                    (perf/not-empty schema) table])
+        sort-rows (filter (comp (complement zero?) :sortkey) rows)
+        key-col   (perf/some #(when (:distkey %) (:column_name %)) rows)
+        diststyle (-> (jdbc/query
+                       spec
+                       [(str "SELECT c.reldiststyle AS reldiststyle FROM pg_class_info c "
+                             "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                             "WHERE n.nspname = COALESCE(?, current_schema()) AND c.relname = ?")
+                        (perf/not-empty schema) table])
+                      first :reldiststyle)
+        distkey   (some-> diststyle (distkey-index key-col))]
+    (cond-> []
+      (seq sort-rows)
+      (conj (let [interleaved? (perf/some (comp neg? :sortkey) sort-rows)
+                  columns      (perf/mapv :column_name sort-rows)]
+              {:name              nil
+               :kind              :sortkey
+               :access-method     nil
+               :is-unique         false
+               :is-primary        false
+               :is-valid          true
+               :key-columns       columns
+               :include-columns   []
+               :partial-predicate nil
+               :definition        (format "%s SORTKEY (%s)"
+                                          (if interleaved? "INTERLEAVED" "COMPOUND")
+                                          (str/join ", " columns))}))
+      distkey (conj distkey))))
+
+(defmethod driver/compile-transform :redshift
+  [driver {:keys [query output-table indexes] :as transform-details}]
+  (if-let [clause (table-attributes-clause driver indexes)]
+    (let [{sql-query :query sql-params :params} query
+          k      (keyword output-table)
+          target (if (namespace k)
+                   (sql.u/quote-name driver :table (namespace k) (name k))
+                   (sql.u/quote-name driver :table (name k)))]
+      [(format "CREATE TABLE %s %s AS %s" target clause sql-query)
+       sql-params])
+    ((get-method driver/compile-transform :sql) driver transform-details)))
+
+(defn- create-table-sql
+  "Render the `CREATE TABLE (...)` for a Python-transform target, inlining sortkey/distkey from `:indexes` when present.
+  Reuses the `:sql-jdbc` renderer for the column list and appends the inline clause."
+  [driver table-name column-definitions {:keys [primary-key indexes]}]
+  (let [base (#'sql-jdbc/create-table!-sql driver table-name column-definitions :primary-key primary-key)]
+    (if-let [clause (table-attributes-clause driver indexes)]
+      (str base " " clause)
+      base)))
+
+(defmethod driver/create-table! :redshift
+  [driver db-id table-name column-definitions & {:as opts}]
+  ;; Same as the inherited `:sql-jdbc` impl, but inlines a sortkey when one is present. Non-transform callers
+  ;; (e.g. uploads) pass no `:indexes`, so the rendered SQL is unchanged for them.
+  (let [sql (create-table-sql driver table-name column-definitions opts)]
+    (jdbc/with-db-transaction [conn (sql-jdbc.conn/db->pooled-connection-spec (driver.u/lib-database db-id))]
+      (jdbc/execute! conn sql))))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                           metabase.driver.sql impls                                            |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; custom Redshift type handling
+
+(defn- external-database-type->base-type
+  "Additional type mappings of external columns. Return nil when no matching type is found."
+  [database-type]
+  (when (or (string? database-type)
+            (instance? clojure.lang.Named database-type))
+    (let [stn  (-> (name database-type) ; sanitized-type-name
+                   (u/lower-case-en))]
+      ;; Following is inspired by mysql docs and redshift jdbc driver code: https://github.com/aws/amazon-redshift-jdbc-driver/blob/master/src/main/java/com/amazon/redshift/jdbc/RedshiftDatabaseMetaData.java#L3414-L3448
+      (cond
+        (str/starts-with? stn "tinyint")   :type/Integer
+        (str/starts-with? stn "smallint")  :type/Integer
+        (str/starts-with? stn "mediumint") :type/Integer
+        (str/starts-with? stn "int")       :type/Integer
+        (str/starts-with? stn "bigint")    :type/BigInteger
+
+        (str/starts-with? stn "float")     :type/Float
+        (str/starts-with? stn "double")    :type/Float
+
+        (and (or (str/starts-with? stn "char")
+                 (str/starts-with? stn "varchar")
+                 (str/starts-with? stn "text"))
+             (re-find #"character set binary" stn))         :type/*
+
+        (str/starts-with? stn "char")                       :type/Text
+        (str/starts-with? stn "varchar")                    :type/Text
+        (str/starts-with? stn "text")                       :type/Text
+        ;; https://dev.mysql.com/doc/refman/8.4/en/charset-national.html
+        (str/starts-with? stn "national varchar")           :type/Text
+        (str/starts-with? stn "nvarchar")                   :type/Text
+        (str/starts-with? stn "nchar varchar")              :type/Text
+        (str/starts-with? stn "national character varying") :type/Text
+        (str/starts-with? stn "national char varying")      :type/Text
+
+        (str/starts-with? stn "tinytext")   :type/Text
+        (str/starts-with? stn "mediumtext") :type/Text
+        (str/starts-with? stn "longtext")   :type/Text
+
+        ;; Iceberg table types - https://docs.aws.amazon.com/redshift/latest/dg/querying-iceberg-supported-data-types.html
+        (= stn "string")                    :type/Text
+        (= stn "boolean")                   :type/Boolean
+        (= stn "long")                      :type/BigInteger
+        (str/starts-with? stn "decimal(")   :type/Decimal
+        (= stn "binary")                    :type/*
+        (= stn "date")                      :type/Date
+        (= stn "timestamp")                 :type/DateTime
+        (= stn "timestamptz")               :type/DateTimeWithTZ
+
+        ;; MySQL federated table enum types
+        (str/starts-with? stn "enum(")      :type/Text
+
+        (= stn "datetime")                  :type/DateTime
+        (= stn "year")                      :type/Integer))))
+
+(def ^:private database-type->base-type
+  (some-fn (sql-jdbc.sync/pattern-based-database-type->base-type
+            [[#"(?i)CHARACTER VARYING" :type/Text]       ; Redshift uses CHARACTER VARYING (N) as a synonym for VARCHAR(N)
+             [#"(?i)NUMERIC"           :type/Decimal]])  ; and also has a NUMERIC(P,S) type, which is the same as DECIMAL(P,S)
+           {:super       :type/*    ; (requested support in metabase#36642)
+            :varbyte     :type/*    ; represents variable-length binary strings
+            :geometry    :type/*    ; spatial data
+            :geography   :type/*    ; spatial data
+            :intervaly2m :type/*    ; interval literal
+            :intervald2s :type/*}))   ; interval literal
+
+(defmethod sql-jdbc.sync/database-type->base-type :redshift
+  [driver column-type]
+  (or (database-type->base-type column-type)
+      (let [assumed-type ((get-method sql-jdbc.sync/database-type->base-type :postgres) driver column-type)]
+        (if-not (contains? #{nil :type/*} assumed-type)
+          assumed-type
+          (if-some [external-assumed-type (external-database-type->base-type column-type)]
+            external-assumed-type
+            assumed-type)))))
+
+(defmethod sql.qp/add-interval-honeysql-form :redshift
+  [_ hsql-form amount unit]
+  (let [hsql-form (h2x/->timestamp hsql-form)]
+    (-> [:dateadd (h2x/literal unit) amount hsql-form]
+        (h2x/with-type-info (h2x/type-info hsql-form)))))
+
+(defmethod sql.qp/unix-timestamp->honeysql [:redshift :seconds]
+  [_ _ expr]
+  (h2x/with-database-type-info
+   (h2x/+ [:raw "TIMESTAMP '1970-01-01T00:00:00Z'"]
+          (h2x/* expr
+                 [:raw "INTERVAL '1 second'"]))
+   :timestamp))
+
+(defmethod sql.qp/current-datetime-honeysql-form :redshift
+  [_driver]
+  :%getdate) ; TODO -- this should include type info
+
+(defmethod sql-jdbc.execute/set-timezone-sql :redshift
+  [_]
+  "SET TIMEZONE TO %s;")
+
+(defn- normalize-details
+  "Get rid of details that were added that aren't relevant anymore."
+  [details]
+  (let [details (if (nil? (:auth-mode details))
+                  (assoc details :auth-mode "password")
+                  details)]
+    (if (= (:auth-mode details) "password")
+      details
+      (dissoc details :username :password))))
+
+(defmethod driver/normalize-db-details :redshift
+  [_ database]
+  (m/update-existing database :details normalize-details))
+
+;; This impl is basically the same as the default impl in [[metabase.driver.sql-jdbc.execute]], but doesn't attempt to
+;; make the connection read-only, because that seems to be causing problems for people
+(defmethod sql-jdbc.execute/do-with-connection-with-options :redshift
+  [driver db-or-id-or-spec {:keys [^String session-timezone], :as options} f]
+  (sql-jdbc.execute/do-with-resolved-connection
+   driver
+   db-or-id-or-spec
+   options
+   (fn [^Connection conn]
+     (when-not (sql-jdbc.execute/recursive-connection?)
+       (sql-jdbc.execute/set-best-transaction-level! driver conn)
+       (sql-jdbc.execute/set-time-zone-if-supported! driver conn session-timezone)
+       (try
+         (.setHoldability conn ResultSet/CLOSE_CURSORS_AT_COMMIT)
+         (catch Throwable e
+           (log/debugf "Error setting default holdability for connection: %s" (ex-message e)))))
+     (f conn))))
+
+;; Not the Postgres impl, which unwraps a pgjdbc connection and sets autosave. Autosave issues SAVEPOINT, which Redshift
+;; rejects. A failed statement in a transform test therefore still aborts the transaction for every statement after it.
+(defmethod driver/do-with-test-connection :redshift
+  [driver database f]
+  ((get-method driver/do-with-test-connection :sql-jdbc) driver database f))
+
+(defn- prepare-statement ^PreparedStatement [^Connection conn sql]
+  (.prepareStatement conn
+                     sql
+                     ResultSet/TYPE_FORWARD_ONLY
+                     ResultSet/CONCUR_READ_ONLY
+                     ResultSet/CLOSE_CURSORS_AT_COMMIT))
+
+(defn- quote-literal-for-connection
+  "Quotes a string literal so that it can be safely inserted into Redshift queries, by returning the result of invoking
+  the Redshift QUOTE_LITERAL function on the given string (which is set in a PreparedStatement as a parameter)."
+  [^Connection conn ^String s]
+  (with-open [stmt (doto (prepare-statement conn "SELECT QUOTE_LITERAL(?);")
+                     (.setString 1 s))
+              rs   (.executeQuery stmt)]
+    (when (.next rs)
+      (.getString rs 1))))
+
+(defn- quote-literal-for-database
+  "This function invokes quote-literal-for-connection with a connection for the given database. See its docstring for
+  more detail."
+  [driver database s]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver
+   database
+   nil
+   (fn [conn]
+     (quote-literal-for-connection conn s))))
+
+(defmethod sql.qp/->honeysql [:redshift :regex-match-first]
+  [driver [_ _opts arg pattern]]
+  [:regexp_substr
+   (sql.qp/->honeysql driver arg)
+   ;; the parameter to REGEXP_SUBSTR can only be a string literal; neither prepared statement parameters nor encoding/
+   ;; decoding functions seem to work (fails with java.sql.SQLExcecption: "The pattern must be a valid UTF-8 literal
+   ;; character expression"), hence we will use a different function to safely escape it before splicing here
+   [:raw (quote-literal-for-database driver (driver-api/database (driver-api/metadata-provider)) pattern)]])
+
+(defmethod sql.qp/->honeysql [:redshift :replace]
+  [driver [_ _opts arg pattern replacement]]
+  [:replace
+   (sql.qp/->honeysql driver arg)
+   (sql.qp/->honeysql driver pattern)
+   (sql.qp/->honeysql driver replacement)])
+
+(defmethod sql.qp/->honeysql [:redshift :concat]
+  [driver [_ _opts & args]]
+  ;; concat() only takes 2 args, so generate multiple concats if we have more,
+  ;; e.g. [:concat :x :y :z] => [:concat [:concat :x :y] :z] => concat(concat(x, y), z)
+  (->> args
+       (map (partial sql.qp/->honeysql driver))
+       (reduce (fn [x y]
+                 (if x
+                   [:concat x y]
+                   y))
+               nil)))
+
+(defmethod sql.qp/->honeysql [:redshift :avg]
+  [driver [_ _opts field]]
+  [:avg [:cast (sql.qp/->honeysql driver field) :float]])
+
+(defmethod sql.qp/->integer :redshift
+  [driver value]
+  (sql.qp/->integer-with-round driver value))
+
+(defn- extract [unit temporal]
+  [::h2x/extract (format "'%s'" (name unit)) temporal])
+
+(defn- datediff [unit x y]
+  [:datediff [:raw (name unit)] x y])
+
+(defmethod sql.qp/->honeysql [:redshift :datetime-diff]
+  [driver [_ _opts x y unit]]
+  (let [x (sql.qp/->honeysql driver x)
+        y (sql.qp/->honeysql driver y)
+        _ (sql.qp/datetime-diff-check-args x y (partial re-find #"(?i)^(timestamp|date)"))
+        ;; unlike postgres, we need to make sure the values are timestamps before we
+        ;; can do the calculation. otherwise, we'll get an error like
+        ;; ERROR: function pg_catalog.date_diff("unknown", ..., ...) does not exist
+        x (h2x/->timestamp x)
+        y (h2x/->timestamp y)]
+    (sql.qp/datetime-diff driver unit x y)))
+
+(defmethod sql.qp/->honeysql [:redshift :relative-datetime]
+  [driver [_ _opts amount unit]]
+  (driver-api/maybe-cacheable-relative-datetime-honeysql driver unit amount))
+
+(defmethod sql.qp/->honeysql [:redshift java.time.LocalDate]
+  [_driver t]
+  (-> [:raw (format "date '%s'" (u.date/format t))]
+      (h2x/with-database-type-info "date")))
+
+(defmethod sql.qp/->honeysql [:redshift java.time.LocalTime]
+  [_driver t]
+  (-> [:raw (format "time '%s'" (u.date/format "HH:mm:ss.SSS" t))]
+      (h2x/with-database-type-info "time")))
+
+(defmethod sql.qp/->honeysql [:redshift java.time.OffsetTime]
+  [_driver t]
+  (-> [:raw (format "time with time zone '%s'" (u.date/format "HH:mm:ss.SSS xxx" t))]
+      (h2x/with-database-type-info "timetz")))
+
+(defmethod sql.qp/->honeysql [:redshift java.time.LocalDateTime]
+  [_driver t]
+  (-> [:raw (format "timestamp '%s'" (u.date/format "yyyy-MM-dd HH:mm:ss.SSS" t))]
+      (h2x/with-database-type-info "timestamp")))
+
+(defmethod sql.qp/->honeysql [:redshift java.time.OffsetDateTime]
+  [_driver t]
+  (-> [:raw (format "timestamp with time zone '%s'" (u.date/format "yyyy-MM-dd HH:mm:ss.SSS xxx" t))]
+      (h2x/with-database-type-info "timestamptz")))
+
+(defmethod sql.qp/->honeysql [:redshift java.time.ZonedDateTime]
+  [driver t]
+  (sql.qp/->honeysql driver (t/offset-date-time t)))
+
+(defmethod sql.qp/datetime-diff [:redshift :year]
+  [driver _unit x y]
+  (h2x// (sql.qp/datetime-diff driver :month x y) 12))
+
+(defmethod sql.qp/datetime-diff [:redshift :quarter]
+  [driver _unit x y]
+  (h2x// (sql.qp/datetime-diff driver :month x y) 3))
+
+(defmethod sql.qp/datetime-diff [:redshift :month]
+  [_driver _unit x y]
+  (h2x/+ (datediff :month x y)
+         ;; redshift's datediff counts month boundaries not whole months, so we need to adjust
+         [:case
+          ;; if x<y but x>y in the month calendar then subtract one month
+          [:and
+           [:< x y]
+           [:> (extract :day x) (extract :day y)]]
+          [:inline -1]
+          ;; if x>y but x<y in the month calendar then add one month
+          [:and
+           [:> x y]
+           [:< (extract :day x) (extract :day y)]]
+          [:inline 1]
+          :else
+          [:inline 0]]))
+
+(defmethod sql.qp/datetime-diff [:redshift :week]
+  [_driver _unit x y]
+  (h2x// (datediff :day x y) 7))
+
+(defmethod sql.qp/datetime-diff [:redshift :day]
+  [_driver _unit x y]
+  (datediff :day x y))
+
+(defmethod sql.qp/datetime-diff [:redshift :hour]
+  [driver _unit x y]
+  (h2x// (sql.qp/datetime-diff driver :second x y) 3600))
+
+(defmethod sql.qp/datetime-diff [:redshift :minute]
+  [driver _unit x y]
+  (h2x// (sql.qp/datetime-diff driver :second x y) 60))
+
+(defmethod sql.qp/datetime-diff [:redshift :second]
+  [_driver _unit x y]
+  (h2x/- (extract :epoch y) (extract :epoch x)))
+
+(defmethod sql.qp/->honeysql [:redshift ::sql.qp/expression-literal-text-value]
+  [driver [_ _opts value]]
+  (->> (sql.qp/->honeysql driver value)
+       (h2x/cast :text)))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                         metabase.driver.sql-jdbc impls                                         |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defmethod sql-jdbc.conn/connection-details->spec :redshift
+  [_ {:keys [host port db dbname auth-mode] :as opts}]
+  (when (and db dbname)
+    (log/warn "Redshift connection details should not contain both 'db' and 'dbname' options. Ignoring 'dbname'."))
+  (sql-jdbc.common/handle-additional-options
+   (merge
+    {:classname                     "com.amazon.redshift.jdbc42.Driver"
+     ;; https://docs.aws.amazon.com/redshift/latest/mgmt/jdbc20-configure-authentication-ssl.html#jdbc20-configure-iam-authentication
+     :subprotocol                   (if (and (string? auth-mode)
+                                             (re-find #"^iam" auth-mode))
+                                      "redshift:iam"
+                                      "redshift")
+     :subname                       (str "//" host ":" port "/" (or db dbname))
+     :ssl                           true
+     :OpenSourceSubProtocolOverride false}
+    (dissoc opts :host :port :db :dbname))))
+
+(prefer-method
+ sql-jdbc.execute/read-column-thunk
+ [::sql-jdbc.legacy/use-legacy-classes-for-read-and-set Types/TIMESTAMP]
+ [:postgres Types/TIMESTAMP])
+
+(defmethod sql-jdbc.execute/read-column-thunk
+  [:redshift Types/OTHER]
+  [driver ^ResultSet rs ^ResultSetMetaData rsmeta ^Integer i]
+  (if (= "interval" (.getColumnTypeName rsmeta i))
+    #(.getValue ^RedshiftInterval (.getObject rs i RedshiftInterval))
+    ((get-method sql-jdbc.execute/read-column-thunk [:postgres (.getColumnType rsmeta i)]) driver rs rsmeta i)))
+
+(prefer-method
+ sql-jdbc.execute/read-column-thunk
+ [::sql-jdbc.legacy/use-legacy-classes-for-read-and-set Types/TIME]
+ [:postgres Types/TIME])
+
+;;; I don't think this should actually ever get called because we should be compiling an `OffsetTime` as a `timetz`
+;;; literal
+(prefer-method
+ sql-jdbc.execute/set-parameter
+ [::sql-jdbc.legacy/use-legacy-classes-for-read-and-set java.time.OffsetTime]
+ [:postgres java.time.OffsetTime])
+
+(defn- field->parameter-value
+  "Map fields used in parameters to parameter `:value`s."
+  [{:keys [user-parameters]}]
+  (into {}
+        (keep (fn [param]
+                (if (contains? param :name)
+                  [(:name param) (:value param)]
+                  (when-let [field-id (match/match-one param
+                                        [:field (field-id :guard integer?) _]
+                                        (when (perf/some #{:dimension} &parents)
+                                          field-id))]
+                    [(:name (driver-api/field (driver-api/metadata-provider) field-id))
+                     (:value param)]))))
+        user-parameters))
+
+(defmethod driver-api/query->remark :redshift
+  [_ query]
+  (let [{:keys [user-id card-id dashboard-id account-id]} (driver-api/query->remark-data query)]
+    (str "/* partner: \"metabase\", "
+         (json/encode {:dashboard_id        dashboard-id
+                       :chart_id            card-id
+                       :optional_user_id    user-id
+                       :optional_account_id account-id
+                       :filter_values       (field->parameter-value query)})
+         " */ "
+         (driver-api/default-query->remark query))))
+
+(defmethod sql-jdbc.execute/set-parameter [:redshift java.time.ZonedDateTime]
+  [driver ps i t]
+  (sql-jdbc.execute/set-parameter driver ps i (t/sql-timestamp (t/with-zone-same-instant t (t/zone-id "UTC")))))
+
+(defmethod driver/upload-type->database-type :redshift
+  [_driver upload-type]
+  (case upload-type
+    :metabase.upload/varchar-255              [[:varchar 255]]
+    :metabase.upload/text                     [[:varchar 65535]]
+    :metabase.upload/int                      [:bigint]
+    ;; identity(1, 1) defines an auto-increment column starting from 1
+    :metabase.upload/auto-incrementing-int-pk [:bigint [:identity 1 1]]
+    :metabase.upload/float                    [(keyword "double precision")]
+    :metabase.upload/boolean                  [:boolean]
+    :metabase.upload/date                     [:date]
+    :metabase.upload/datetime                 [:timestamp]
+    :metabase.upload/offset-datetime          [:timestamp-with-time-zone]))
+
+(defmulti ^:private type->database-type
+  "Internal type->database-type multimethod for Redshift that dispatches on type."
+  {:arglists '([type])}
+  identity)
+
+(defmethod type->database-type :type/TextLike [_] [[:varchar 65535]])
+(defmethod type->database-type :type/Text [_] [[:varchar 65535]])
+(defmethod type->database-type :type/Number [_] [:bigint])
+(defmethod type->database-type :type/BigInteger [_] [:bigint])
+(defmethod type->database-type :type/Integer [_] [:integer])
+(defmethod type->database-type :type/Float [_] [(keyword "double precision")])
+(defmethod type->database-type :type/Boolean [_] [:boolean])
+(defmethod type->database-type :type/Date [_] [:date])
+(defmethod type->database-type :type/DateTime [_] [:timestamp])
+(defmethod type->database-type :type/DateTimeWithTZ [_] [:timestamp-with-time-zone])
+(defmethod type->database-type :type/Time [_] [:time])
+
+(defmethod driver/type->database-type :redshift
+  [_driver base-type]
+  (type->database-type base-type))
+
+(defmethod driver/allowed-promotions :redshift [_] {})
+
+(defmethod driver/table-name-length-limit :redshift
+  [_driver]
+  ;; https://docs.aws.amazon.com/redshift/latest/dg/r_names.html
+  127)
+
+(defmethod driver/insert-into! :redshift
+  [driver db-id table-name column-names values]
+  ((get-method driver/insert-into! :sql-jdbc) driver db-id table-name column-names values))
+
+;; Cal 2024-04-10: Commented this out instead of deleting it. We used to use this for `driver/describe-database` (see metabase#37439)
+;; This might be helpful for getting privileges for actions in the future.
+#_(defmethod sql-jdbc.sync/current-user-table-privileges :redshift
+    [_driver conn-spec & {:as _options}]
+    ;; KNOWN LIMITATION: this won't return privileges for external tables, calling has_table_privilege on an external table
+    ;; result in an operation not supported error
+    (->> (jdbc/query
+          conn-spec
+          (str/join
+           "\n"
+           ["with table_privileges as ("
+            " select"
+            "   NULL as role,"
+            "   t.schemaname as schema,"
+            "   t.objectname as table,"
+            ;; if `has_table_privilege` is true `has_any_column_privilege` is false and vice versa, so we have to check both.
+            "   pg_catalog.has_table_privilege(current_user, '\"' || t.schemaname || '\".\"' || t.objectname || '\"',  'SELECT')"
+            "     OR pg_catalog.has_any_column_privilege(current_user, '\"' || t.schemaname || '\"' || '.' || '\"' || t.objectname || '\"',  'SELECT') as select,"
+            "   pg_catalog.has_table_privilege(current_user, '\"' || t.schemaname || '\"' || '.' || '\"' || t.objectname || '\"',  'UPDATE')"
+            "     OR pg_catalog.has_any_column_privilege(current_user, '\"' || t.schemaname || '\"' || '.' || '\"' || t.objectname || '\"',  'UPDATE') as update,"
+            "   pg_catalog.has_table_privilege(current_user, '\"' || t.schemaname || '\"' || '.' || '\"' || t.objectname || '\"',  'INSERT') as insert,"
+            "   pg_catalog.has_table_privilege(current_user, '\"' || t.schemaname || '\"' || '.' || '\"' || t.objectname || '\"',  'DELETE') as delete"
+            " from ("
+            "   select schemaname, tablename as objectname from pg_catalog.pg_tables"
+            "   union"
+            "   select schemaname, viewname as objectname from pg_views"
+            " ) t"
+            " where t.schemaname !~ '^pg_'"
+            "   and t.schemaname <> 'information_schema'"
+            "   and pg_catalog.has_schema_privilege(current_user, t.schemaname, 'USAGE')"
+            ")"
+            "select t.*"
+            "from table_privileges t"]))
+         (filter #(or (:select %) (:update %) (:delete %) (:update %)))))
+
+;;; ----------------------------------------------- Connection Impersonation ------------------------------------------
+
+(defmethod sql-jdbc/set-role-statement :redshift
+  [driver conn role]
+  (let [special-chars-pattern #"[^a-zA-Z0-9_]"
+        needs-quote?          (re-find special-chars-pattern role)
+        quoted-role           (cond->> role
+                                needs-quote? (driver.postgres/memoized-quote-identifier driver conn))]
+    (format "SET SESSION AUTHORIZATION %s;" quoted-role)))
+
+(defmethod driver.sql/default-database-role :redshift
+  [_ _]
+  "DEFAULT")
+
+(defmethod driver/add-columns! :redshift
+  [driver db-id table-name column-definitions & {:as settings}]
+  ;; Redshift doesn't support adding multiple columns at a time, so we break it up
+  (let [f (get-method driver/add-columns! :postgres)]
+    (doseq [[k v] column-definitions]
+      (f driver db-id table-name {k v} settings))))
+
+;; overriding the old method is picked up by alter-table-columns!'s back-compat dispatch, covering both
+#_{:clj-kondo/ignore [:deprecated-var]}
+(defmethod driver/alter-columns! :redshift
+  [_driver _db-id _table-name column-definitions]
+  ;; TODO: redshift doesn't allow promotion of ints to floats using ALTER TABLE.
+  (let [[column-name type-and-constraints] (first column-definitions)
+        type (first type-and-constraints)]
+    (throw (ex-info (format "There's a value with the wrong type ('%s') in the '%s' column" (name type) (name column-name)) {}))))
+
+(defmethod sql.qp/cast-temporal-byte [:redshift :Coercion/YYYYMMDDHHMMSSBytes->Temporal]
+  [driver _coercion-strategy expr]
+  (sql.qp/cast-temporal-string driver :Coercion/YYYYMMDDHHMMSSString->Temporal
+                               [:from_varbyte expr (h2x/literal "UTF8")]))
+
+(defmethod sql.qp/cast-temporal-byte [:redshift :Coercion/ISO8601Bytes->Temporal]
+  [driver _coercion-strategy expr]
+  (sql.qp/cast-temporal-string driver :Coercion/ISO8601->DateTime
+                               [:from_varbyte expr (h2x/literal "UTF8")]))
+
+(defmethod sql-jdbc/impl-table-known-to-not-exist? :redshift
+  [_ e]
+  ;; https://docs.aws.amazon.com/redshift/latest/mgmt/rsql-query-tool-error-codes.html
+  ;; 42P01: undefined_table, 3F000: invalid_schema_name
+  (contains? #{"42P01" "3F000"} (sql-jdbc/get-sql-state e)))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                         Workspace Isolation                                                    |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; All three workspace-isolation multimethods are overridden for Redshift:
+;;
+;; - `init` drops the postgres impl's trailing `GRANT "<user>" TO CURRENT_USER`
+;;   (PG-specific role-membership syntax Redshift rejects).
+;;
+;; - `grant-workspace-read-access!` adds `REVOKE CREATE ON SCHEMA … FROM <user>`
+;;   and `REVOKE INSERT, UPDATE, DELETE, … ON ALL TABLES IN SCHEMA … FROM <user>`
+;;   per source schema, plus pre-flight probes for the public-CREATE-grant and
+;;   public-write limits (see below).
+;;
+;; - `destroy` replaces the postgres impl's `DROP OWNED BY` (which behaves
+;;   differently in Redshift) with explicit per-schema REVOKEs.
+;;
+;; Isolation limit, checked at init time via [[check-no-public-create-in-cluster!]]
+;; for every database of the cluster and every schema of each, and at grant time via
+;; [[assert-no-public-create-grant!]] and [[check-no-public-writes!]] for each input schema:
+;; a user receives privileges either directly or through PUBLIC. REVOKE-ing
+;; a privilege from a specific user only removes their direct grant: it can't
+;; override a PUBLIC grant. Redshift's `public` schema has CREATE granted to
+;; PUBLIC by default in every database, and Redshift has no CONNECT privilege to keep a
+;; user out of a database, so on a default-config cluster the workspace user can create
+;; tables in `public` of any database, becomes their owner, and `DROP USER` then fails at
+;; deprovisioning. The checks fail fast with a 412 that names the REVOKEs for the
+;; cluster admin to run before retrying.
+
+(defn- user-exists?
+  "Check if a Redshift user exists."
+  [conn username]
+  (seq (jdbc/query conn ["SELECT 1 FROM pg_user WHERE usename = ?" username])))
+
+(defn- public-create-grant?
+  "Redshift-flavored check for `public-create-grant?`. Postgres reads
+   `pg_namespace.nspacl::text`, but Redshift refuses to cast `aclitem` to
+   character varying — so we use Redshift's own `SVV_SCHEMA_PRIVILEGES`
+   system view instead, which exposes the equivalent grant info as plain
+   columns."
+  [conn schema-name]
+  (boolean
+   (seq (jdbc/query conn
+                    ["SELECT 1 FROM svv_schema_privileges
+                       WHERE namespace_name = ?
+                         AND identity_type = 'public'
+                         AND privilege_type = 'CREATE'"
+                     schema-name]))))
+
+(defn- quote-schema [s] (sql.u/quote-name :redshift :schema s))
+(defn- quote-field  [s] (sql.u/quote-name :redshift :field s))
+
+(defn- schema-exists?
+  "Check if a schema exists in Redshift."
+  [conn schema-name]
+  (seq (jdbc/query conn ["SELECT 1 FROM pg_namespace WHERE nspname = ?" schema-name])))
+
+(defn- start-workspace-transaction!
+  "Pins search_path to pg_catalog for the current transaction. Call it first in every transaction of the workspace
+  methods: a function that a workspace user planted in a schema on the default search_path (`public`) would otherwise
+  run with the privileges of the admin connection's login (CVE-2018-1058)."
+  [conn]
+  (jdbc/execute! conn ["SET LOCAL search_path TO pg_catalog"]))
+
+(defn- exists-error
+  "The 409 init throws when objects it would create are already in the warehouse. `existing` lists them, each a map of
+  `:what` (a description), `:drop-sql` (the statement an admin runs to remove it when no workspace uses it) and
+  `:data`, in the order the drops must run: the schema first, because the user holds a privilege on it, and
+  `DROP USER` fails while it does. The objects may belong to another workspace, so init leaves them unchanged, and the
+  caller must not tear down after this error. `cause`, the server's error, may be nil."
+  [existing cause]
+  (let [[they them] (if (= 1 (count existing)) ["It" "it"] ["They" "them"])
+        user?       (perf/some (comp :user :data) existing)]
+    (ex-info (str (format (str "The warehouse already has a %s. %s may belong to another workspace, so init left %s "
+                               "unchanged. If no workspace uses %s, run %s, and retry.")
+                          (str/join " and a " (map :what existing))
+                          they them them
+                          (str/join ", then " (map #(str "`" (:drop-sql %) "`") existing)))
+                  (when user?
+                    " `DROP USER` fails while the user holds a privilege on any object, so revoke those first."))
+             (apply merge {:status-code 409, :workspace/cleanup? false} (map :data existing))
+             cause)))
+
+(defn- existing-schema
+  "The entry of [[exists-error]] for an output schema named `schema`."
+  [schema]
+  {:what     (str "schema named " (quote-schema schema))
+   :drop-sql (format "DROP SCHEMA %s CASCADE;" (quote-schema schema))
+   :data     {:schema schema}})
+
+(defn- existing-user
+  "The entry of [[exists-error]] for a workspace user named `user`."
+  [user]
+  {:what     (str "user named " (quote-field user))
+   :drop-sql (format "DROP USER %s;" (quote-field user))
+   :data     {:user user}})
+
+(defn- public-create-schemas
+  "The schemas of the connected database that grant CREATE to PUBLIC."
+  [conn]
+  (map :namespace_name (jdbc/query conn [(str "SELECT DISTINCT namespace_name FROM svv_schema_privileges "
+                                              "WHERE identity_type = 'public' AND privilege_type = 'CREATE' "
+                                              "ORDER BY namespace_name")])))
+
+(defn- current-database [conn]
+  (:db (first (jdbc/query conn ["SELECT current_database() AS db"]))))
+
+(defn- local-databases
+  "The databases of the cluster, not those created from a datashare. Redshift has no CONNECT privilege for a database
+  user, so every user, the workspace user included, may connect to each of them."
+  [conn]
+  (map :database_name (jdbc/query conn [(str "SELECT database_name FROM svv_redshift_databases "
+                                             "WHERE database_type = 'local' ORDER BY database_name")])))
+
+(defn- public-create-databases
+  "The databases of the cluster that grant CREATE to PUBLIC, where every user may create a schema."
+  [conn]
+  (map :database_name (jdbc/query conn [(str "SELECT DISTINCT database_name FROM svv_database_privileges "
+                                             "WHERE identity_type = 'public' AND privilege_type = 'CREATE' "
+                                             "AND privilege_scope = 'DATABASE' ORDER BY database_name")])))
+
+(def ^:private other-database-timeouts
+  "Redshift JDBC connection properties, in seconds, for a connection to another database of the cluster: the driver sets
+  no login or socket timeout by default, so a stalled connection would hang init with no bound."
+  {:loginTimeout 10, :socketTimeout 60})
+
+(defn- do-in-other-database
+  "Calls `(f conn)` in a transaction on database `db` of the same cluster, as the admin connection's login, and returns
+  what it returns."
+  [database db f]
+  (sql-jdbc.conn/do-with-connection-spec-for-testing-connection
+   :redshift
+   (-> (driver.conn/effective-details (driver.u/lib-database (:id database)))
+       (dissoc :dbname)
+       (assoc :db db))
+   (fn [spec]
+     (jdbc/with-db-transaction [conn (merge spec other-database-timeouts)]
+       (start-workspace-transaction! conn)
+       (f conn)))))
+
+(defn- public-create-findings
+  "`[database-name schemas]` for each of `databases`: the schemas there that grant CREATE to PUBLIC, or `:unverifiable`
+  when the admin connection's login cannot check. `current` is the connected database, read on `conn`."
+  [database conn current databases]
+  (for [db databases]
+    [db (if (= db current)
+          (public-create-schemas conn)
+          (try
+            (do-in-other-database database db #(doall (public-create-schemas %)))
+            ;; any failure to check leaves the database unverified, and init refuses it
+            (catch Exception e
+              (log/warnf e "Could not check database %s for schemas that grant CREATE to PUBLIC" db)
+              :unverifiable)))]))
+
+(defn- public-create-error
+  "The 412 init throws when the workspace user could create objects outside its output schema. `databases` grant
+  CREATE to PUBLIC, `schemas` are `[database schema]` pairs whose schema grants CREATE to PUBLIC, and `unverifiable`
+  are databases the admin connection's login could not check. Returns nil when all three are empty."
+  [databases schemas unverifiable]
+  (when (or (seq databases) (seq schemas) (seq unverifiable))
+    (ex-info
+     (str "The workspace user could create objects outside its output schema."
+          (when (seq databases)
+            (format " These databases grant CREATE to PUBLIC, so it could create schemas there: %s."
+                    (str/join ", " databases)))
+          (when (seq schemas)
+            (format " These schemas grant CREATE to PUBLIC: %s."
+                    (str/join ", " (for [[db schema] schemas] (str db "." schema)))))
+          (when (perf/some (fn [[_db schema]] (= "public" schema)) schemas)
+            (str " Redshift grants CREATE on `public` to PUBLIC by default, in every database. The REVOKE on `public` "
+                 "also takes CREATE there from every other login that relies on PUBLIC's grant, so give such logins a "
+                 "direct GRANT."))
+          (when (seq unverifiable)
+            (format (str " The admin connection's login could not check these databases: %s. Every user may "
+                         "connect to every database of the cluster, so they must be checked.")
+                    (str/join ", " unverifiable)))
+          (when (or (seq databases) (seq schemas))
+            (str " As the owner of each database and schema named, or a superuser, run "
+                 (str/join ", " (concat
+                                 (for [db databases]
+                                   (format "`REVOKE CREATE ON DATABASE %s FROM PUBLIC;`" (quote-field db)))
+                                 (for [[db schema] schemas]
+                                   (format "`REVOKE CREATE ON SCHEMA %s FROM PUBLIC;` in database %s"
+                                           (quote-schema schema) (quote-field db)))))
+                 "."))
+          (when (seq unverifiable)
+            " Make sure the admin connection's login can connect to each database named.")
+          " Then retry."
+          (when (or (seq databases) (seq schemas))
+            (str " The REVOKEs persist, but each database created later has a `public` that grants CREATE to PUBLIC "
+                 "again, and init refuses it until its REVOKE runs.")))
+     {:status-code        412
+      :workspace/cleanup? false
+      :databases          (vec databases)
+      :schemas            (vec (for [[db schema] schemas] (str db "." schema)))
+      :unverifiable       (vec unverifiable)})))
+
+(defn- check-no-public-create-in-cluster!
+  "Throws a 412 naming the REVOKEs to run when a database of the cluster grants CREATE to PUBLIC, or a schema of one
+  does (`public` does by default), or when the admin connection's login cannot check a database.
+  Every user, the workspace user included, may connect to every database of the cluster and create objects in such a
+  schema: writes outside its output schema, and objects that keep `DROP USER` from succeeding."
+  [database conn]
+  (let [current      (current-database conn)
+        checked      (distinct (cons current (local-databases conn)))
+        findings     (doall (public-create-findings database conn current checked))
+        schemas      (for [[db found] findings :when (sequential? found), schema found] [db schema])
+        unverifiable (for [[db found] findings :when (= :unverifiable found)] db)]
+    (when-let [error (public-create-error (public-create-databases conn) schemas unverifiable)]
+      (throw error))))
+
+(defn- current-user-usesuper?
+  "True when `current_user` has `usesuper`. Superusers can ALTER DEFAULT
+   PRIVILEGES FOR USER <anyone>, so they bypass the membership check below.
+
+   Redshift's user-membership model differs from PostgreSQL's: there is no
+   `pg_has_role(name, name, text)` overload (the function doesn't exist on
+   Redshift at all on RA3 clusters), and `pg_group` is not generally populated.
+   The practical membership graph collapses to: you are `current_user`, or you
+   are a superuser. Anything else fails at REVOKE time."
+  [conn]
+  (boolean (:usesuper (first (jdbc/query conn ["SELECT usesuper FROM pg_user WHERE usename = current_user"])))))
+
+(defn- check-superuser!
+  "Throws a 412 unless the admin connection's login is a superuser. Teardown ends the workspace user's sessions, and
+  only a superuser may end another user's session. The system views that init reads for grants to PUBLIC show a login
+  that is not a superuser only the identities it has access to or owns."
+  [conn]
+  (when-not (current-user-usesuper? conn)
+    (throw (ex-info (str "Workspaces on Redshift need a superuser admin login. Only a superuser can end the sessions of "
+                         "another user, which teardown must do. A login that is not a superuser may not see every grant "
+                         "to PUBLIC in every database, which init must check. Connect the database with a superuser "
+                         "login and retry.")
+                    {:status-code 412, :workspace/cleanup? false}))))
+
+(defn- check-init-preconditions!
+  "Throws before init makes any change: a 412 when the admin connection's login is not a superuser, a 409 when the
+  workspace user or its output schema already exists, a 412 when PUBLIC can create in a database of the cluster or in
+  a schema of one."
+  [database conn user schema]
+  (check-superuser! conn)
+  (let [existing (cond-> []
+                   (schema-exists? conn schema) (conj (existing-schema schema))
+                   (user-exists? conn user)     (conj (existing-user user)))]
+    (when (seq existing)
+      (throw (exists-error existing nil))))
+  (check-no-public-create-in-cluster! database conn))
+
+(defn- init-workspace-sqls
+  "The statements init runs, in order, once [[check-init-preconditions!]] has passed."
+  [user escaped-password schema]
+  (let [quoted-schema (quote-schema schema)
+        quoted-user   (quote-field user)]
+    [(format "CREATE SCHEMA %s" quoted-schema)
+     (format "CREATE USER %s WITH PASSWORD '%s'" quoted-user escaped-password)
+     ;; Schema-level grant only (Redshift's two schema privileges):
+     ;;   USAGE  - access the schema
+     ;;   CREATE - create tables in it
+     ;; Table DML comes from ownership (the user owns the tables it creates), so we skip
+     ;; `ALTER DEFAULT PRIVILEGES ... GRANT ALL ON TABLES` (that only covers tables created
+     ;; by the admin connection, which never happens on the transform path).
+     (format "GRANT USAGE, CREATE ON SCHEMA %s TO %s" quoted-schema quoted-user)]))
+
+(defn- end-sessions!
+  "Ends every open session of `user`, so that none holds a lock that the drops in teardown wait on. STV_SESSIONS shows
+  a regular user only its own sessions, and only a superuser may end another user's session, so this ends nothing
+  unless the admin connection's login is a superuser. It does not stop `user` from opening a new session after the
+  sessions end."
+  [conn user]
+  ;; `pg_terminate_backend` runs only on the leader node, so Redshift refuses it in a statement that reads a table:
+  ;; the pids come from one query, and each session ends in a statement of its own
+  (doseq [{:keys [process]} (jdbc/query conn ["SELECT process FROM stv_sessions WHERE TRIM(user_name) = ?" user])]
+    (jdbc/query conn ["SELECT pg_terminate_backend(?) AS ended" process])))
+
+(defn- block-logins-sql
+  "The statement that keeps `user` from opening a new session. A connection limit of 0 refuses every new connection of a
+  user that is not a superuser, whatever it authenticates with, and leaves its open sessions as they are."
+  [user]
+  (format "ALTER USER %s CONNECTION LIMIT 0" (quote-field user)))
+
+(defn- block-logins!
+  "Keeps the workspace user `user` from opening a new session, in a transaction of its own that commits before teardown
+  ends the user's sessions. Returns the error when that fails, or nil."
+  [spec user]
+  (try
+    (jdbc/with-db-transaction [t-conn spec]
+      (start-workspace-transaction! t-conn)
+      (when (user-exists? t-conn user)
+        (jdbc/execute! t-conn [(block-logins-sql user)])))
+    nil
+    (catch Exception e
+      e)))
+
+(defn- assert-no-public-create-grant!
+  [conn schema-name]
+  (when (public-create-grant? conn schema-name)
+    (driver.postgres/raise-public-create-grant! schema-name)))
+
+(def ^:private public-write-privileges
+  "The table privileges that let a grantee change a table or its definition."
+  "('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'ALTER', 'DROP', 'REFERENCES')")
+
+(defn- public-writes
+  "The grants to PUBLIC of a privilege that changes a table in `schema`, now or once it is created: table-level grants
+  on its tables (`svv_relation_privileges`), and a user's default privileges for the schema (`svv_default_privileges`).
+  It does not read default privileges for the whole database, or column-level grants. Each is a map of `:kind` (`\"table\"` or `\"default\"`),
+  `:object` (the table, or the user whose default privileges grant it) and `:privileges`, in the order of the query."
+  [conn schema]
+  (->> (jdbc/query conn [(str "SELECT 'table' AS kind, relation_name AS object, privilege_type AS privilege "
+                              "FROM svv_relation_privileges "
+                              "WHERE namespace_name = ? AND identity_type = 'public' "
+                              "  AND privilege_type IN " public-write-privileges " "
+                              "UNION ALL "
+                              "SELECT 'default', owner_name, privilege_type "
+                              "FROM svv_default_privileges "
+                              "WHERE schema_name = ? AND grantee_type = 'public' AND object_type = 'RELATION' "
+                              "  AND privilege_type IN " public-write-privileges " "
+                              "ORDER BY 1, 2, 3")
+                         schema schema])
+       (partition-by (juxt :kind :object))
+       (map (fn [rows]
+              (assoc (perf/select-keys (first rows) [:kind :object])
+                     :privileges (str/join ", " (distinct (map :privilege rows))))))))
+
+(defn- public-writes-error
+  "The 412 grant throws when `grants`, from [[public-writes]], let PUBLIC change tables in input schema `schema`, or nil
+  when there are none."
+  [schema grants]
+  (when (seq grants)
+    (let [label  (fn [{:keys [kind object]}]
+                   (if (= "table" kind) object (str "default privileges for " object)))
+          revoke (fn [{:keys [kind object privileges]}]
+                   (if (= "table" kind)
+                     (format "REVOKE %s ON TABLE %s.%s FROM PUBLIC;"
+                             privileges (quote-schema schema) (sql.u/quote-name :redshift :table object))
+                     (format "ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA %s REVOKE %s ON TABLES FROM PUBLIC;"
+                             (quote-field object) (quote-schema schema) privileges)))]
+      (ex-info (format (str "%d grant(s) let PUBLIC change tables in schema %s: %s. Every user, the workspace user "
+                            "included, holds them, and no REVOKE from the workspace user takes them back. As the owner "
+                            "of each table and the user of each default privilege named, or a superuser, run `%s` and "
+                            "retry.")
+                       (count grants) (quote-schema schema) (str/join ", " (map label grants))
+                       (str/join " " (map revoke grants)))
+               {:status-code 412, :schema schema, :objects (perf/mapv label grants)}))))
+
+(defn- check-no-public-writes!
+  "Throws the 412 of [[public-writes-error]] when a grant to PUBLIC lets the workspace user change a table in input
+  schema `schema`."
+  [conn schema]
+  (when-let [error (public-writes-error schema (public-writes conn schema))]
+    (throw error)))
+
+(defn- relation-owners-in-schema
+  "Distinct relation owners in `schema-name`. Caller filters out the ones
+   `current_user` can impersonate.
+
+   Why this matters: `ALTER DEFAULT PRIVILEGES IN SCHEMA <s>` (without
+   `FOR ROLE`) only affects future objects created by the connection user.
+   Tables created later by foreign owners skip the iso-user grant -- workspace
+   data goes stale silently.
+
+   `relkind` set matches the scope of `ALTER DEFAULT PRIVILEGES ... ON TABLES`:
+   ordinary tables (`r`), views (`v`), materialized views (`m`), partitioned
+   tables (`p`), and foreign tables (`f`). Spectrum external tables live in
+   `svv_external_tables` and are not covered by `pg_default_acl`, so they need
+   no entry here."
+  [conn schema-name]
+  (->> (jdbc/query conn
+                   [(str "SELECT DISTINCT pg_get_userbyid(c.relowner) AS owner "
+                         "FROM pg_class c "
+                         "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                         "WHERE n.nspname = ? "
+                         "  AND c.relkind IN ('r','v','m','p','f') "
+                         "ORDER BY owner")
+                    schema-name])
+       (keep :owner)))
+
+(defn- default-acl-grantors-in-schema
+  "Distinct grantors of pre-existing `pg_default_acl` entries in `schema-name`.
+   Caller filters out the ones `current_user` can impersonate.
+
+   Distinct from [[relation-owners-in-schema]]: that surfaces future-object
+   grantor risk; this surfaces pre-existing default-priv rows we will need to
+   REVOKE FOR USER <grantor> at destroy time. Both block the workspace
+   contract."
+  [conn schema-name]
+  (->> (jdbc/query conn
+                   [(str "SELECT DISTINCT u.usename AS owner "
+                         "FROM pg_catalog.pg_default_acl d "
+                         "JOIN pg_catalog.pg_user      u ON u.usesysid = d.defacluser "
+                         "JOIN pg_catalog.pg_namespace n ON n.oid      = d.defaclnamespace "
+                         "WHERE n.nspname = ? "
+                         "  AND d.defaclobjtype = 'r' "
+                         "ORDER BY owner")
+                    schema-name])
+       (keep :owner)))
+
+(defn assert-can-alter-default-privileges!
+  "Throws when `schema-name` has relation-owners or pre-existing default-priv
+   grantors that `current_user` cannot impersonate via `FOR USER`. On Redshift
+   the impersonation graph collapses to: `owner == current_user`, or
+   `current_user` is a superuser.
+
+   Without this guarantee we can neither extend defaults to future objects of
+   foreign owners (silent data drift) nor REVOKE pre-existing default-priv
+   entries at destroy time (DROP USER fails -> GHY-3709)."
+  [conn schema-name]
+  (when-not (current-user-usesuper? conn)
+    (let [me      (:me (first (jdbc/query conn ["SELECT current_user AS me"])))
+          owners  (->> (concat (relation-owners-in-schema     conn schema-name)
+                               (default-acl-grantors-in-schema conn schema-name))
+                       distinct
+                       (remove #(= % me)))]
+      (when (seq owners)
+        ;; Redshift has no role membership to grant: the remedies are owning the objects, or a superuser login
+        (throw (ex-info (format (str "The admin connection's login %s is not a member of %d role(s) that own objects "
+                                     "or default privileges in schema %s: %s. On Redshift it cannot act for them, so "
+                                     "the workspace user would lose access to their future tables. Make the login "
+                                     "the owner of those objects, or connect as a superuser, and retry.")
+                                (quote-field me) (count owners) (quote-schema schema-name)
+                                (str/join ", " owners))
+                        {:status-code 412
+                         :schema      schema-name
+                         :owners      (vec owners)}))))))
+
+(defn- sql-states
+  "The SQLStates of `t` and of every cause of it."
+  [t]
+  (keep #(when (instance? java.sql.SQLException %) (.getSQLState ^java.sql.SQLException %))
+        (take-while some? (iterate ex-cause t))))
+
+(defn- init-error
+  "`t`, from a failed init, marked so the caller does not tear the workspace down: init runs in one transaction, so
+  it leaves nothing behind. A schema or user of the workspace's name may be one that another session has just
+  committed (SQLState 42P06 or 42710): that gives the 409 of [[exists-error]], with `t` as its cause. A connection
+  failure once the transaction is `committing?` stays unmarked: the transaction may have committed, and its objects
+  then need the teardown. When the rollback fails too, clojure.java.jdbc throws its own error with the original under
+  `:handling`; that original is the one to judge."
+  [t committing? user schema]
+  (let [t      (or (when (contains? (ex-data t) :rollback) (:handling (ex-data t))) t)
+        states (sql-states t)]
+    (cond
+      (or (contains? (ex-data t) :workspace/cleanup?)
+          (and committing? (perf/some #(str/starts-with? % "08") states)))
+      t
+
+      (perf/some #{"42P06"} states)
+      (exists-error [(existing-schema schema)] t)
+
+      (perf/some #{"42710"} states)
+      (exists-error [(existing-user user)] t)
+
+      :else
+      (ex-info (ex-message t) (assoc (ex-data t) :workspace/cleanup? false) t))))
+
+(defmethod driver/init-workspace-isolation! :redshift
+  [_driver database workspace]
+  (let [schema-name      (:schema workspace)
+        read-user        (:database_details workspace)
+        escaped-password (sql.u/escape-sql (:password read-user) :ansi)
+        ;; set once the transaction's last statement has run, so that the only step left is COMMIT
+        committing?      (volatile! false)]
+    (try
+      (sql-jdbc.execute/do-with-connection-with-options
+       :redshift
+       (sql-jdbc.conn/db->pooled-connection-spec (driver.u/lib-database (:id database)))
+       nil
+       (fn [^Connection conn]
+         (try
+           (jdbc/with-db-transaction [t-conn {:connection conn}]
+             (start-workspace-transaction! t-conn)
+             ;; a user or schema of this name may be another workspace's: taking it over would hand that workspace's
+             ;; grants to this one, and cleaning up after this init would drop it
+             (check-init-preconditions! database t-conn (:user read-user) schema-name)
+             (with-open [^Statement stmt (.createStatement ^Connection (:connection t-conn))]
+               (doseq [sql (init-workspace-sqls (:user read-user) escaped-password schema-name)]
+                 (.addBatch ^Statement stmt ^String sql))
+               (try
+                 (.executeBatch ^Statement stmt)
+                 (catch Throwable t
+                   (throw (driver.u/scrub-exceptions (driver.u/batch-exception t)
+                                                     [(:password read-user) escaped-password])))))
+             (vreset! committing? true))
+           (catch Throwable t
+             ;; a failed rollback leaves the connection with autocommit off, in a state the pool cannot be trusted to
+             ;; reset, so it is discarded
+             (when (contains? (ex-data t) :rollback)
+               (sql-jdbc.conn/discard-pooled-connection! conn))
+             (throw t)))))
+      (catch Throwable t
+        (let [error (init-error t @committing? (:user read-user) schema-name)]
+          ;; init-error judges the error that caused a failed rollback: attach the rollback's own error, so that it
+          ;; is not lost
+          (when-let [rollback-error (:rollback (ex-data t))]
+            (.addSuppressed ^Throwable error ^Throwable rollback-error))
+          (throw error))))
+    nil))
+
+(defmethod driver/grant-workspace-read-access! :redshift
+  [_driver database workspace schemas]
+  (let [username       (-> workspace :database_details :user)
+        quoted-user    (quote-field username)
+        source-schemas (set schemas)
+        spec           (sql-jdbc.conn/db->pooled-connection-spec (driver.u/lib-database (:id database)))]
+    ;; Pre-flight check (queries only, own transaction, search_path pinned). Redshift's
+    ;; GRANT statements error loudly when grant authority is missing, so PG's
+    ;; silent-skip USAGE/SELECT class doesn't reproduce here. But two ALTER
+    ;; DEFAULT PRIVILEGES failure modes do reproduce and need explicit checks:
+    ;;
+    ;; - Foreign relation-owners: tables created later by an owner the
+    ;;   connection user can't impersonate skip our default-priv grant.
+    ;; - Foreign default-priv grantors: pre-existing `pg_default_acl` rows whose
+    ;;   grantor we can't impersonate at destroy time -> `DROP USER` fails
+    ;;   (GHY-3709).
+    (jdbc/with-db-transaction [check-conn spec]
+      (start-workspace-transaction! check-conn)
+      (doseq [s source-schemas]
+        (assert-no-public-create-grant!       check-conn s)
+        (check-no-public-writes!              check-conn s)
+        (assert-can-alter-default-privileges! check-conn s)))
+    ;; Grants run as one batched transaction; it commits before this fn
+    ;; returns, so a subsequent describe-database from a different connection
+    ;; still observes the privileges.
+    (jdbc/with-db-transaction [t-conn spec]
+      (start-workspace-transaction! t-conn)
+      (with-open [^Statement stmt (.createStatement ^Connection (:connection t-conn))]
+        (doseq [s   source-schemas
+                :let [quoted-schema (quote-schema s)]
+                sql [(format "GRANT USAGE ON SCHEMA %s TO %s" quoted-schema quoted-user)
+                     (format "REVOKE CREATE ON SCHEMA %s FROM %s" quoted-schema quoted-user)
+                     (format "REVOKE INSERT, UPDATE, DELETE, REFERENCES ON ALL TABLES IN SCHEMA %s FROM %s"
+                             quoted-schema quoted-user)
+                     ;; Schema-wide SELECT — workspace-scoped users receive whole-schema access.
+                     ;; Per-table granularity intentionally discarded (API contract is namespace-grained).
+                     (format "GRANT SELECT ON ALL TABLES IN SCHEMA %s TO %s" quoted-schema quoted-user)
+                     (format "ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT ON TABLES TO %s"
+                             quoted-schema quoted-user)]]
+          (.addBatch ^Statement stmt ^String sql))
+        (try
+          (.executeBatch ^Statement stmt)
+          (catch Throwable t
+            (throw (driver.u/batch-exception t))))))))
+
+(defn- schemas-with-user-grants
+  "Query Redshift to find schemas where the user has been granted schema-level
+   (USAGE/CREATE) or relation-level privileges. Both views are needed:
+   `svv_relation_privileges` only surfaces GRANTs on existing relations, so a
+   granted schema with no tables (or whose tables were dropped later) only
+   shows up in `svv_schema_privileges` — missing it leaves a USAGE grant behind
+   and `DROP USER` then fails with `user ... has a privilege on some object`.
+   Neither view lists ALTER DEFAULT PRIVILEGES entries; see
+   [[default-acl-grants-for-user]] for those."
+  [conn username]
+  (->> (jdbc/query conn
+                   ["SELECT DISTINCT namespace_name FROM svv_relation_privileges
+                      WHERE identity_name = ? AND identity_type = 'user'
+                     UNION
+                     SELECT DISTINCT namespace_name FROM svv_schema_privileges
+                      WHERE identity_name = ? AND identity_type = 'user'"
+                    username username])
+       (keep :namespace_name)))
+
+(defn- escape-like-pattern
+  "Escape PostgreSQL/Redshift LIKE metacharacters (`%`, `_`) and our chosen
+   escape char (`|`) in `s` so it matches literally. Used with `ESCAPE '|'` on
+   the LIKE clause -- `|` chosen over `\\` because Redshift's SQL parser treats
+   a literal `'\\'` as an unterminated string. Without this escaping, iso-user
+   names containing `_` (which they always do -- the generator produces
+   `mb__isolation_<id>` form) would match siblings via wildcard, and the
+   destroy could revoke default-priv rows belonging to unrelated users."
+  [^String s]
+  (-> s
+      (str/replace "|" "||")
+      (str/replace "%" "|%")
+      (str/replace "_" "|_")))
+
+(defn- default-acl-grants-for-user
+  "Enumerate `(grantor, schema)` pairs that have an ALTER DEFAULT PRIVILEGES entry referencing
+   `username` as a grantee. Returns a seq of `{:grantor :schema}` maps.
+
+   Redshift exposes `pg_default_acl` but rejects `aclitem`->`varchar` casts and does not
+   provide `aclexplode`. We use `array_to_string(defaclacl, ',')` (allowed on aclitem[]).
+   Verified live: Redshift's `array_to_string` strips the enclosing braces of an `aclitem[]`,
+   so each entry is comma-separated text of the form `grantee=privs/grantor`. To make the
+   grantee match unambiguous, we prepend a `,` to the haystack and search for `,<name>=` --
+   that way a row with only one grantee (no preceding entries) still matches.
+
+   LIKE metacharacters in `username` are escaped with `ESCAPE '|'` so `_` and `%` match
+   literally -- critical because the iso-user generator always produces `_`-containing
+   names. Pipe over backslash because Redshift's parser rejects a literal backslash escape
+   clause as an unterminated string.
+
+   Schema-less entries (`defaclnamespace = 0`, applies to any schema) are excluded -- our
+   provisioning only ever issues `ALTER DEFAULT PRIVILEGES IN SCHEMA`, never the no-schema
+   form, so those entries do not originate here."
+  [conn username]
+  (let [esc (escape-like-pattern username)]
+    (jdbc/query
+     conn
+     [(str "SELECT u.usename   AS grantor, "
+           "       n.nspname   AS schema "
+           "FROM   pg_catalog.pg_default_acl d "
+           "JOIN   pg_catalog.pg_user      u ON u.usesysid = d.defacluser "
+           "JOIN   pg_catalog.pg_namespace n ON n.oid      = d.defaclnamespace "
+           "WHERE  d.defaclobjtype = 'r' "
+           "  AND (',' || array_to_string(d.defaclacl, ',')) LIKE ? ESCAPE '|'")
+      (str "%," esc "=%")])))
+
+(defmethod driver/destroy-workspace-isolation! :redshift
+  [_driver database workspace]
+  (let [schema-name   (:schema workspace)
+        username      (-> workspace :database_details :user)
+        quoted-user   (quote-field username)
+        quoted-schema (quote-schema schema-name)
+        spec          (sql-jdbc.conn/db->pooled-connection-spec (driver.u/lib-database (:id database)))
+        block-error   (block-logins! spec username)]
+    ;; One transactional batch: foreign-grantor default-priv revokes, relation
+    ;; revokes, iso-schema bare REVOKE, DROP SCHEMA, DROP USER. Redshift has no
+    ;; SAVEPOINT and aborts the whole transaction on the first error, so a
+    ;; stale row (e.g. a schema dropped between discovery and execution) fails
+    ;; the entire destroy — that's fine: the workspace layer records the
+    ;; failure and the deprovision is retried, re-discovering fresh state.
+    ;;
+    ;; Logins are blocked first, in a transaction that commits before the sessions end, so that no session opened after
+    ;; the kills holds a lock the drops wait on. A failure to block them does not stop the drops: it is logged when the
+    ;; drops succeed, and kept as suppressed when they fail.
+    (u/prog1 (try
+               (jdbc/with-db-transaction [t-conn spec]
+                 (start-workspace-transaction! t-conn)
+                 (let [user-exists     (user-exists? t-conn username)
+                       schema-exists   (schema-exists? t-conn schema-name)
+                       granted-schemas (when user-exists
+                                         (schemas-with-user-grants t-conn username))]
+                   (when user-exists
+                     (end-sessions! t-conn username))
+                   (with-open [^Statement stmt (.createStatement ^Connection (:connection t-conn))]
+                     (when user-exists
+                       ;; Foreign-grantor default-priv rows must be revoked FOR USER their
+                       ;; grantor before DROP USER (GHY-3709); Redshift has no DROP OWNED BY.
+                       (doseq [{:keys [grantor schema]} (default-acl-grants-for-user t-conn username)]
+                         (.addBatch ^Statement stmt
+                                    ^String (format "ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA %s REVOKE ALL ON TABLES FROM %s"
+                                                    (quote-field grantor) (quote-schema schema) quoted-user)))
+                       (doseq [schema granted-schemas
+                               :let [quoted-granted-schema (quote-schema schema)]]
+                         (.addBatch ^Statement stmt
+                                    ^String (format "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %s FROM %s"
+                                                    quoted-granted-schema quoted-user))
+                         (.addBatch ^Statement stmt
+                                    ^String (format "REVOKE ALL PRIVILEGES ON SCHEMA %s FROM %s"
+                                                    quoted-granted-schema quoted-user)))
+                       ;; Iso-namespace default-priv was issued by the connection user at init time, so a
+                       ;; no-FOR-USER REVOKE is correct here. Guarded on schema existence to avoid
+                       ;; erroring on a schema that was dropped manually.
+                       (when schema-exists
+                         (.addBatch ^Statement stmt
+                                    ^String (format "ALTER DEFAULT PRIVILEGES IN SCHEMA %s REVOKE ALL ON TABLES FROM %s"
+                                                    quoted-schema quoted-user))))
+                     ;; These are safe with IF EXISTS
+                     (.addBatch ^Statement stmt
+                                ^String (format "DROP SCHEMA IF EXISTS %s CASCADE" quoted-schema))
+                     (.addBatch ^Statement stmt
+                                ^String (format "DROP USER IF EXISTS %s" quoted-user))
+                     (try
+                       (.executeBatch ^Statement stmt)
+                       (catch Throwable t
+                         (throw (driver.u/batch-exception t)))))))
+               (catch Throwable t
+                 (when block-error
+                   (.addSuppressed t ^Throwable block-error))
+                 (throw t)))
+      (when block-error
+        (log/warnf block-error "Could not keep workspace user %s from logging in before teardown ended its sessions"
+                   username)))))
+
+(defmethod driver/llm-sql-dialect-resource :redshift [_]
+  "metabot/prompts/dialects/redshift.md")

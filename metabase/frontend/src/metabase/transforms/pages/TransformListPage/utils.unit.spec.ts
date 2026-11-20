@@ -1,0 +1,353 @@
+import { createMockMetadata } from "__support__/metadata";
+import { getLibQuery } from "metabase/transforms/utils";
+import * as Lib from "metabase-lib";
+import { DEFAULT_TEST_QUERY, SAMPLE_PROVIDER } from "metabase-lib/test-helpers";
+import type { DatabaseId } from "metabase-types/api";
+import {
+  createMockCollection,
+  createMockTemplateTag,
+  createMockTransform,
+  createMockTransformOwner,
+  createMockTransformTarget,
+} from "metabase-types/api/mocks";
+
+import type { TreeNode } from "./types";
+import {
+  buildTreeData,
+  getDescendantCollectionIds,
+  getFolderTransforms,
+  getIncrementalWarning,
+  getRemoteSyncChangesTarget,
+} from "./utils";
+
+jest.mock("metabase/transforms/utils", () => ({
+  getLibQuery: jest.fn(),
+}));
+
+jest.mock("metabase-lib", () => ({
+  ...jest.requireActual<typeof Lib>("metabase-lib"),
+  templateTags: jest.fn(),
+}));
+
+const query = Lib.createTestQuery(SAMPLE_PROVIDER, DEFAULT_TEST_QUERY);
+
+// Unjustified type cast. FIXME
+const mockGetLibQuery = getLibQuery as jest.MockedFunction<typeof getLibQuery>;
+// Unjustified type cast. FIXME
+const mockTemplateTags = Lib.templateTags as jest.MockedFunction<
+  typeof Lib.templateTags
+>;
+
+describe("buildTreeData", () => {
+  it("should return empty array when no collections or transforms", () => {
+    expect(buildTreeData(undefined, undefined)).toEqual([]);
+    expect(buildTreeData([], [])).toEqual([]);
+  });
+
+  it("should include owner data in transform nodes", () => {
+    const owner = createMockTransformOwner({
+      id: 1,
+      first_name: "Test",
+      last_name: "Owner",
+      email: "test@example.com",
+    });
+    const transform = createMockTransform({
+      id: 1,
+      name: "Test Transform",
+      owner_user_id: 1,
+      owner,
+    });
+
+    const result = buildTreeData([], [transform]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].owner).toEqual(owner);
+    expect(result[0].owner_email).toBeUndefined();
+  });
+
+  it("should include owner_email in transform nodes when set", () => {
+    const transform = createMockTransform({
+      id: 1,
+      name: "Test Transform",
+      owner_email: "external@example.com",
+      owner: createMockTransformOwner({ email: "external@example.com" }),
+    });
+
+    const result = buildTreeData([], [transform]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].owner).toMatchObject({ email: "external@example.com" });
+    expect(result[0].owner_email).toBe("external@example.com");
+  });
+
+  it("should handle transforms without owners", () => {
+    const transform = createMockTransform({
+      id: 1,
+      name: "Test Transform",
+      owner: undefined,
+      owner_email: undefined,
+    });
+
+    const result = buildTreeData([], [transform]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].owner).toBeUndefined();
+    expect(result[0].owner_email).toBeUndefined();
+  });
+
+  it("should handle multiple transforms with different owner types", () => {
+    const userOwner = createMockTransformOwner({
+      id: 1,
+      first_name: "User",
+      last_name: "Owner",
+      email: "user@example.com",
+    });
+
+    const transforms = [
+      createMockTransform({
+        id: 1,
+        name: "Transform with user owner",
+        owner_user_id: 1,
+        owner: userOwner,
+      }),
+      createMockTransform({
+        id: 2,
+        name: "Transform with email owner",
+        owner_email: "external@example.com",
+        owner: createMockTransformOwner({ email: "external@example.com" }),
+      }),
+      createMockTransform({
+        id: 3,
+        name: "Transform without owner",
+        owner: undefined,
+      }),
+    ];
+
+    const result = buildTreeData([], transforms);
+
+    expect(result).toHaveLength(3);
+    expect(result[0].owner).toEqual(userOwner);
+    expect(result[1].owner).toMatchObject({ email: "external@example.com" });
+    expect(result[1].owner_email).toBe("external@example.com");
+    expect(result[2].owner).toBeUndefined();
+  });
+});
+
+describe("getDescendantCollectionIds", () => {
+  it("includes the folder's own collection id and all nested folder ids", () => {
+    const collections = [
+      createMockCollection({
+        id: 1,
+        name: "Parent",
+        children: [
+          createMockCollection({
+            id: 2,
+            name: "Child",
+            children: [createMockCollection({ id: 3, name: "Grandchild" })],
+          }),
+        ],
+      }),
+    ];
+
+    const [parentNode] = buildTreeData(collections, []);
+
+    expect(getDescendantCollectionIds(parentNode)).toEqual(new Set([1, 2, 3]));
+  });
+
+  it("ignores transform leaves and counts only collection ids", () => {
+    const collections = [
+      createMockCollection({ id: 10, name: "Folder", children: [] }),
+    ];
+    const transforms = [
+      createMockTransform({ id: 99, name: "T", collection_id: 10 }),
+    ];
+
+    const [folderNode] = buildTreeData(collections, transforms);
+
+    expect(getDescendantCollectionIds(folderNode)).toEqual(new Set([10]));
+  });
+});
+
+describe("getRemoteSyncChangesTarget", () => {
+  it("targets folder collections and transforms", () => {
+    const collections = [createMockCollection({ id: 1, name: "Folder" })];
+    const transforms = [
+      createMockTransform({ id: 7, name: "Transform", collection_id: 1 }),
+    ];
+
+    const [folderNode] = buildTreeData(collections, transforms);
+    const [transformNode] = folderNode.children ?? [];
+
+    expect(getRemoteSyncChangesTarget(folderNode)).toEqual({
+      type: "collection",
+      id: 1,
+    });
+    expect(getRemoteSyncChangesTarget(transformNode)).toEqual({
+      type: "transform",
+      id: 7,
+    });
+  });
+});
+
+describe("getIncrementalWarning", () => {
+  const metadata = createMockMetadata({});
+  const getMetadataProvider = (databaseId: DatabaseId | null) =>
+    Lib.metadataProvider(databaseId, metadata);
+
+  it("should return undefined for non-incremental transform", () => {
+    const transform = createMockTransform({
+      target: createMockTransformTarget({ type: "table" }),
+    });
+
+    expect(
+      getIncrementalWarning(transform, getMetadataProvider),
+    ).toBeUndefined();
+  });
+
+  it("should warn when native query has no table variables", () => {
+    mockGetLibQuery.mockReturnValue(query);
+    mockTemplateTags.mockReturnValue([
+      createMockTemplateTag({
+        id: "1",
+        name: "snippet1",
+        type: "snippet",
+      }),
+    ]);
+
+    const transform = createMockTransform({
+      source_type: "native",
+      target: createMockTransformTarget({ type: "table-incremental" }),
+    });
+
+    const result = getIncrementalWarning(transform, getMetadataProvider);
+    expect(result).toMatch(/table variable/);
+  });
+
+  it("should warn when native query has no lib query (getLibQuery returns null)", () => {
+    mockGetLibQuery.mockReturnValue(null);
+
+    const transform = createMockTransform({
+      source_type: "native",
+      target: createMockTransformTarget({ type: "table-incremental" }),
+    });
+
+    const result = getIncrementalWarning(transform, getMetadataProvider);
+    expect(result).toMatch(/table variable/);
+  });
+
+  it("should warn when incremental transform has no checkpoint field", () => {
+    mockGetLibQuery.mockReturnValue(query);
+    mockTemplateTags.mockReturnValue([
+      createMockTemplateTag({
+        id: "1",
+        name: "my_table",
+        type: "table",
+        "table-id": 42,
+      }),
+    ]);
+
+    const transform = createMockTransform({
+      source_type: "native",
+      source: {
+        type: "query",
+        query: Lib.createTestJsQuery(SAMPLE_PROVIDER, DEFAULT_TEST_QUERY),
+      },
+      target: createMockTransformTarget({ type: "table-incremental" }),
+    });
+
+    const result = getIncrementalWarning(transform, getMetadataProvider);
+    expect(result).toMatch(/checkpoint field/);
+  });
+
+  it("should return undefined for properly configured native incremental transform", () => {
+    mockGetLibQuery.mockReturnValue(query);
+    mockTemplateTags.mockReturnValue([
+      createMockTemplateTag({
+        id: "1",
+        name: "my_table",
+        type: "table",
+        "table-id": 42,
+      }),
+    ]);
+
+    const transform = createMockTransform({
+      source_type: "native",
+      source: {
+        type: "query",
+        query: Lib.createTestJsQuery(SAMPLE_PROVIDER, DEFAULT_TEST_QUERY),
+        "source-incremental-strategy": {
+          type: "checkpoint",
+          "checkpoint-filter-field-id": 99,
+        },
+      },
+      target: createMockTransformTarget({ type: "table-incremental" }),
+    });
+
+    expect(
+      getIncrementalWarning(transform, getMetadataProvider),
+    ).toBeUndefined();
+  });
+
+  it("should warn when mbql incremental transform has no checkpoint field", () => {
+    const transform = createMockTransform({
+      source_type: "mbql",
+      target: createMockTransformTarget({ type: "table-incremental" }),
+    });
+
+    const result = getIncrementalWarning(transform, getMetadataProvider);
+    expect(result).toMatch(/checkpoint field/);
+  });
+
+  it("should return undefined for properly configured mbql incremental transform", () => {
+    const transform = createMockTransform({
+      source_type: "mbql",
+      source: {
+        type: "query",
+        query: Lib.createTestJsQuery(SAMPLE_PROVIDER, DEFAULT_TEST_QUERY),
+        "source-incremental-strategy": {
+          type: "checkpoint",
+          "checkpoint-filter-field-id": 99,
+        },
+      },
+      target: createMockTransformTarget({ type: "table-incremental" }),
+    });
+
+    expect(
+      getIncrementalWarning(transform, getMetadataProvider),
+    ).toBeUndefined();
+  });
+});
+
+describe("getFolderTransforms", () => {
+  const folderNode = (id: number, children: TreeNode[] = []): TreeNode => ({
+    id: `collection-${id}`,
+    name: `Folder ${id}`,
+    nodeType: "folder",
+    icon: "folder",
+    collection: createMockCollection({ id, namespace: "transforms" }),
+    children,
+  });
+
+  it("returns the transforms of the folder and its subfolders, by name", () => {
+    const folder = folderNode(1, [folderNode(2)]);
+    const transforms = [
+      createMockTransform({ id: 1, name: "Zebra", collection_id: 1 }),
+      createMockTransform({ id: 2, name: "Nested", collection_id: 2 }),
+      createMockTransform({ id: 3, name: "Elsewhere", collection_id: 3 }),
+      createMockTransform({ id: 4, name: "Root", collection_id: null }),
+      createMockTransform({ id: 5, name: "Apple", collection_id: 1 }),
+    ];
+
+    expect(getFolderTransforms(folder, transforms).map((t) => t.id)).toEqual([
+      5, 2, 1,
+    ]);
+  });
+
+  it("returns an empty list for a folder without transforms", () => {
+    expect(
+      getFolderTransforms(folderNode(1), [
+        createMockTransform({ id: 1, collection_id: 2 }),
+      ]),
+    ).toEqual([]);
+  });
+});

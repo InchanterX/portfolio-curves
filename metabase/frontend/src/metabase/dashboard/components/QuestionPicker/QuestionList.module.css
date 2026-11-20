@@ -1,0 +1,27 @@
+.QuestionListItemRoot {
+  .QuestionListItem {
+    flex: 1;
+  }
+
+  &:hover {
+    .QuestionListItemIcon {
+      color: var(--mb-color-text-primary-inverse);
+    }
+  }
+
+  .QuestionListItemIcon {
+    color: var(--mb-color-core-brand);
+  }
+
+  .QuestionListItemIcon:last-child {
+    justify-self: start;
+  }
+
+  .VisualizerButton {
+    visibility: hidden;
+  }
+
+  &:hover .VisualizerButton {
+    visibility: visible;
+  }
+}

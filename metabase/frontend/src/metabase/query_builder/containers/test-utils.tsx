@@ -1,0 +1,526 @@
+/* eslint-disable i18next/no-literal-string */
+import userEvent from "@testing-library/user-event";
+import fetchMock from "fetch-mock";
+import type { ComponentPropsWithoutRef } from "react";
+
+import {
+  setupAdhocQueryMetadataEndpoint,
+  setupAlertsEndpoints,
+  setupBookmarksEndpoints,
+  setupCardDataset,
+  setupCardQueryEndpoints,
+  setupCardQueryMetadataEndpoint,
+  setupCardsEndpoints,
+  setupCollectionByIdEndpoint,
+  setupCollectionsEndpoints,
+  setupDatabasesEndpoints,
+  setupFieldValuesEndpoint,
+  setupGetUserKeyValueEndpoint,
+  setupModelIndexEndpoints,
+  setupPropertiesEndpoints,
+  setupRecentViewsAndSelectionsEndpoints,
+  setupRecentViewsEndpoints,
+  setupSearchEndpoints,
+  setupTimelinesEndpoints,
+  setupUserMetabotPermissionsEndpoint,
+} from "__support__/server-mocks";
+import { mockSettings } from "__support__/settings";
+import { createMockState } from "__support__/state";
+import {
+  act,
+  renderWithProviders,
+  screen,
+  waitFor,
+  waitForLoaderToBeRemoved,
+  within,
+} from "__support__/ui";
+import { LOAD_COMPLETE_FAVICON } from "metabase/common/hooks/constants";
+import { serializeCardForUrl } from "metabase/common/utils/card";
+import { NewItemMenu } from "metabase/nav/components/NewItemMenu";
+import type { State } from "metabase/redux/store";
+import { Route } from "metabase/router";
+import { checkNotNull } from "metabase/utils/types";
+import * as Lib from "metabase-lib";
+import { DEFAULT_TEST_QUERY, SAMPLE_PROVIDER } from "metabase-lib/test-helpers";
+import type {
+  Bookmark,
+  Card,
+  CardQueryMetadata,
+  Collection,
+  Database,
+  Dataset,
+  Timeline,
+  UnsavedCard,
+  User,
+} from "metabase-types/api";
+import {
+  createMockCard,
+  createMockCardQueryMetadata,
+  createMockCollection,
+  createMockColumn,
+  createMockDataset,
+  createMockFieldValues,
+  createMockModelIndex,
+  createMockSettings,
+  createMockUnsavedCard,
+  createMockUser,
+  createMockUserPermissions,
+} from "metabase-types/api/mocks";
+import {
+  ORDERS,
+  ORDERS_ID,
+  SAMPLE_DB_ID,
+  createSampleDatabase,
+} from "metabase-types/api/mocks/presets";
+
+import { getIsRunning } from "../store/selectors";
+
+import { QueryBuilder } from "./QueryBuilder";
+
+export const TEST_DB = createSampleDatabase();
+
+export const TEST_CARD = createMockCard({
+  id: 1,
+  name: "Test card",
+  type: "model",
+  dataset_query: Lib.toJsQuery(
+    Lib.createTestQuery(SAMPLE_PROVIDER, DEFAULT_TEST_QUERY),
+  ),
+});
+
+export const TEST_TIME_SERIES_WITH_DATE_BREAKOUT_CARD = createMockCard({
+  ...TEST_CARD,
+  type: "question",
+  dataset_query: Lib.toJsQuery(
+    Lib.createTestQuery(SAMPLE_PROVIDER, {
+      stages: [
+        {
+          source: { type: "table", id: ORDERS_ID },
+          aggregations: [{ type: "operator", operator: "count", args: [] }],
+          breakouts: [{ type: "column", name: "CREATED_AT" }],
+        },
+      ],
+    }),
+  ),
+});
+
+export const TEST_TIME_SERIES_WITH_CUSTOM_DATE_BREAKOUT_CARD = createMockCard({
+  ...TEST_CARD,
+  type: "question",
+  dataset_query: Lib.toJsQuery(
+    Lib.createTestQuery(SAMPLE_PROVIDER, {
+      stages: [
+        {
+          source: { type: "table", id: ORDERS_ID },
+          expressions: [
+            {
+              name: "Custom Created At",
+              value: { type: "column", name: "CREATED_AT" },
+            },
+          ],
+          aggregations: [{ type: "operator", operator: "count", args: [] }],
+          breakouts: [{ type: "column", name: "Custom Created At" }],
+        },
+      ],
+    }),
+  ),
+});
+
+export const TEST_CARD_VISUALIZATION = createMockCard({
+  ...TEST_CARD,
+  dataset_query: Lib.toJsQuery(
+    Lib.createTestQuery(SAMPLE_PROVIDER, {
+      stages: [{ source: { type: "table", id: ORDERS_ID } }],
+    }),
+  ),
+});
+
+export const TEST_MODEL_CARD = createMockCard({
+  dataset_query: Lib.toJsQuery(
+    Lib.createTestQuery(SAMPLE_PROVIDER, {
+      stages: [{ source: { type: "table", id: ORDERS_ID }, limit: 1 }],
+    }),
+  ),
+  type: "model",
+  display: "table",
+  description: "Test description",
+});
+
+export const TEST_MODEL_CARD_SLUG = [
+  TEST_MODEL_CARD.id,
+  TEST_MODEL_CARD.name.toLowerCase(),
+].join("-");
+
+const TEST_NATIVE_QUERY = Lib.createTestNativeQuery(SAMPLE_PROVIDER, {
+  query: "SELECT 1",
+});
+
+export const TEST_NATIVE_CARD = createMockCard({
+  query_type: "native",
+  dataset_query: Lib.toJsQuery(TEST_NATIVE_QUERY),
+});
+
+export const TEST_NATIVE_CARD_DATASET = createMockDataset({
+  json_query: Lib.toLegacyQuery(TEST_NATIVE_QUERY),
+  database_id: SAMPLE_DB_ID,
+  status: "completed",
+  row_count: 1,
+  running_time: 35,
+});
+
+export const TEST_UNSAVED_NATIVE_CARD = createMockUnsavedCard({
+  dataset_query: Lib.toJsQuery(TEST_NATIVE_QUERY),
+});
+
+export const TEST_STRUCTURED_CARD = createMockCard({
+  name: "Orders question",
+  dataset_query: Lib.toJsQuery(
+    Lib.createTestQuery(SAMPLE_PROVIDER, {
+      stages: [{ source: { type: "table", id: ORDERS_ID }, limit: 1 }],
+    }),
+  ),
+});
+
+export const TEST_UNSAVED_STRUCTURED_CARD = createMockUnsavedCard({
+  dataset_query: Lib.toJsQuery(
+    Lib.createTestQuery(SAMPLE_PROVIDER, {
+      stages: [{ source: { type: "table", id: ORDERS_ID } }],
+    }),
+  ),
+});
+
+export const TEST_MODEL_DATASET_COLUMN = createMockColumn({
+  name: "ID",
+  source: "fields",
+  display_name: "ID",
+  description: "test",
+  field_ref: ["field", ORDERS.ID, null],
+});
+
+export const TEST_MODEL_DATASET = createMockDataset({
+  data: {
+    rows: [["1"]],
+    cols: [TEST_MODEL_DATASET_COLUMN],
+  },
+  database_id: SAMPLE_DB_ID,
+  status: "completed",
+  context: "question",
+  row_count: 1,
+  running_time: 35,
+});
+
+export const TEST_COLLECTION = createMockCollection();
+
+const TestQueryBuilder = (
+  props: ComponentPropsWithoutRef<typeof QueryBuilder>,
+) => {
+  return (
+    <div data-testid="test-container">
+      <link rel="icon" />
+      <QueryBuilder {...props} />
+    </div>
+  );
+};
+
+const TestHome = () => <NewItemMenu trigger={<button>New</button>} />;
+
+const TestRedirect = () => <div />;
+
+const isSavedCard = (card: Card | UnsavedCard | null): card is Card => {
+  return card !== null && "id" in card;
+};
+
+interface SetupOpts {
+  card: Card | UnsavedCard | null;
+  bookmarks?: Bookmark[];
+  dataset?: Dataset;
+  database?: Database;
+  echoQueryParameters?: boolean;
+  initialRoute?: string;
+  metadata?: CardQueryMetadata;
+  timelines?: Timeline[];
+  timelinesResponse?: () => Promise<Timeline[]>;
+  withUndos?: boolean;
+  currentUser?: User;
+  /**
+   * Set to false to look at the page while the question is still loading.
+   */
+  waitForLoad?: boolean;
+  hasAcknowledgedModelModal?: boolean;
+  collections?: Collection[];
+  /**
+   * The query builder reads `window.location` to decide whether a URL update
+   * adds a history entry, as it does in a browser. The memory test router
+   * leaves `window.location` alone, so back and forward land on duplicate
+   * entries. This keeps `window.location` in step with the router. Reset it in
+   * `afterEach` with `window.history.replaceState(null, "", "/")`.
+   */
+  syncWindowLocation?: boolean;
+}
+
+export const setup = async ({
+  card,
+  bookmarks = [],
+  dataset = createMockDataset(),
+  database = TEST_DB,
+  echoQueryParameters = false,
+  initialRoute = `/question${
+    card == null
+      ? ""
+      : isSavedCard(card)
+        ? `/${card.id}`
+        : `#${serializeCardForUrl(card)}`
+  }`,
+  metadata = createMockCardQueryMetadata({ databases: [database] }),
+  timelines = [],
+  timelinesResponse,
+  withUndos = false,
+  currentUser = createMockUser({
+    permissions: createMockUserPermissions({
+      can_create_queries: true,
+      can_create_native_queries: true,
+    }),
+  }),
+  waitForLoad = true,
+  hasAcknowledgedModelModal = false,
+  collections = [TEST_COLLECTION],
+  syncWindowLocation = false,
+}: SetupOpts) => {
+  setupUserMetabotPermissionsEndpoint();
+  setupDatabasesEndpoints([database]);
+  setupCardDataset({ dataset });
+  setupSearchEndpoints([]);
+  setupPropertiesEndpoints(createMockSettings());
+  setupCollectionsEndpoints({ collections: [] });
+  setupBookmarksEndpoints(bookmarks);
+  setupTimelinesEndpoints(timelinesResponse ?? timelines);
+  setupCollectionByIdEndpoint({ collections });
+  setupFieldValuesEndpoint(
+    createMockFieldValues({ field_id: Number(ORDERS.QUANTITY) }),
+  );
+  setupRecentViewsEndpoints([]);
+  setupRecentViewsAndSelectionsEndpoints([]);
+  setupGetUserKeyValueEndpoint({
+    namespace: "user_acknowledgement",
+    key: "turn_into_model_modal",
+    value: hasAcknowledgedModelModal,
+  });
+
+  setupAdhocQueryMetadataEndpoint(metadata);
+
+  if (isSavedCard(card)) {
+    setupCardsEndpoints([card]);
+    setupCardQueryMetadataEndpoint(card, metadata);
+    setupCardQueryEndpoints(card, dataset, {
+      echoParameters: echoQueryParameters,
+    });
+    setupAlertsEndpoints(card, []);
+    setupModelIndexEndpoints(card.id, []);
+  }
+
+  if (card === null) {
+    fetchMock.get("path:/api/model-index", [createMockModelIndex()]);
+  }
+
+  const mockEventListener = jest.spyOn(window, "addEventListener");
+
+  if (syncWindowLocation) {
+    window.history.replaceState(null, "", initialRoute);
+  }
+
+  const { container, router, store } = renderWithProviders(
+    <>
+      <Route>
+        <Route path="/" element={<TestHome />} />
+        <Route path="/model">
+          <Route path="query" element={<TestQueryBuilder />} />
+          <Route path="columns" element={<TestQueryBuilder />} />
+          <Route path="metadata" element={<TestQueryBuilder />} />
+          <Route path="notebook" element={<TestQueryBuilder />} />
+          <Route path=":slug" element={<TestQueryBuilder />} />
+          <Route path=":slug/query" element={<TestQueryBuilder />} />
+          <Route path=":slug/columns" element={<TestQueryBuilder />} />
+          <Route path=":slug/metadata" element={<TestQueryBuilder />} />
+          <Route path=":slug/notebook" element={<TestQueryBuilder />} />
+          <Route path=":slug/:objectId" element={<TestQueryBuilder />} />
+        </Route>
+        <Route path="/question">
+          <Route index element={<TestQueryBuilder />} />
+          <Route path="notebook" element={<TestQueryBuilder />} />
+          <Route path=":slug" element={<TestQueryBuilder />} />
+          <Route path=":slug/notebook" element={<TestQueryBuilder />} />
+        </Route>
+        <Route path="/redirect" element={<TestRedirect />} />
+      </Route>
+    </>,
+    {
+      withRouter: true,
+      withUndos,
+      initialRoute,
+      storeInitialState: createMockState({
+        currentUser,
+        settings: mockSettings({ "site-url": "http://localhost:3000" }),
+      }),
+    },
+  );
+
+  if (syncWindowLocation) {
+    checkNotNull(router).onLocationChange(({ pathname, search, hash }) => {
+      window.history.replaceState(null, "", `${pathname}${search}${hash}`);
+    });
+  }
+
+  const result = {
+    container,
+    router: checkNotNull(router),
+    mockEventListener,
+    store,
+  };
+
+  if (!waitForLoad) {
+    return result;
+  }
+
+  await waitForLoaderToBeRemoved();
+  const opensSavedQuestion =
+    isSavedCard(card) &&
+    /^\/(question|model)\//.test(initialRoute) &&
+    !initialRoute.includes("/notebook");
+  if (opensSavedQuestion) {
+    await waitForQueryToFinish(store);
+  } else {
+    await waitForQueryToStart();
+  }
+
+  return result;
+};
+
+/**
+ * QueryBuilder starts running a question from a timer, after its loader is gone.
+ * The timer fires here inside act(), so the start of the run cannot update the
+ * page after the test.
+ */
+export const waitForQueryToStart = async () => {
+  await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+};
+
+const QUERY_RUN_PATH = /^\/api\/(card\/\d+\/query|dataset)$/;
+
+/**
+ * A saved question runs its query as it opens. The loader can be gone before
+ * the question is even loaded, so this waits for the run's request and then for
+ * the run to end, and the result cannot update the page after the test.
+ */
+export const waitForQueryToFinish = async (store: {
+  getState: () => State;
+}) => {
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory
+        .calls()
+        .some((call) => QUERY_RUN_PATH.test(new URL(call.url).pathname)),
+    ).toBe(true),
+  );
+  await waitFor(() => expect(getIsRunning(store.getState())).toBe(false));
+};
+
+export const triggerNativeQueryChange = async () => {
+  await waitForNativeQueryEditorReady();
+
+  const inputArea = within(
+    screen.getByTestId("mock-native-query-editor"),
+  ).getByRole("textbox");
+
+  await userEvent.click(inputArea);
+  await userEvent.type(inputArea, "0");
+  await userEvent.tab();
+};
+
+export const triggerMetadataChange = async () => {
+  await waitFor(() => {
+    expect(screen.getByLabelText("Display name")).toBeInTheDocument();
+  });
+
+  const columnDisplayName = screen.getByLabelText("Display name");
+
+  await userEvent.click(columnDisplayName);
+  await userEvent.type(columnDisplayName, "X");
+  await userEvent.tab();
+};
+
+export const triggerVisualizationQueryChange = async () => {
+  await userEvent.click(screen.getByText("Filter"));
+
+  const popover = screen.getByRole("dialog");
+  await userEvent.click(within(popover).getByText("Total"));
+  const maxInput = within(popover).getByPlaceholderText("Max");
+  await userEvent.type(maxInput, "1000");
+  await userEvent.click(await screen.findByText("Apply filter"));
+};
+
+export const triggerNotebookQueryChange = async () => {
+  await userEvent.click(await screen.findByText("Row limit"));
+
+  const rowLimitInput = await within(
+    screen.getByTestId("step-limit-0-0"),
+  ).findByPlaceholderText("Enter a limit");
+
+  await userEvent.click(rowLimitInput);
+  await userEvent.type(rowLimitInput, "1");
+  await userEvent.tab();
+};
+
+/**
+ * Reverts triggerNotebookQueryChange call
+ */
+export const revertNotebookQueryChange = async () => {
+  const limitStep = screen.getByTestId("step-limit-0-0");
+  const limitInput =
+    await within(limitStep).findByPlaceholderText("Enter a limit");
+
+  await userEvent.click(limitInput);
+  await userEvent.type(limitInput, "{backspace}");
+  await userEvent.tab();
+};
+
+export const waitForSaveChangesToBeEnabled = async () => {
+  await waitFor(() => {
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+  });
+};
+
+export const waitForSaveChangesToBeDisabled = async () => {
+  await waitFor(() => {
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+};
+
+export const waitForSaveToBeEnabled = async () => {
+  await waitFor(() => {
+    expect(screen.getByText("Save")).toBeEnabled();
+  });
+};
+
+export const saveQuestion = async () => {
+  await waitForSaveToBeEnabled();
+  await userEvent.click(screen.getByText("Save"));
+  await userEvent.click(
+    within(screen.getByTestId("save-question-modal")).getByText("Save"),
+  );
+  await waitFor(() => {
+    expect(screen.queryByTestId("save-question-modal")).not.toBeInTheDocument();
+  });
+};
+
+export const waitForNativeQueryEditorReady = async () => {
+  await waitFor(() => {
+    expect(screen.getByTestId("mock-native-query-editor")).toBeInTheDocument();
+  });
+};
+
+export const waitForFaviconReady = async (container: HTMLElement) => {
+  await waitFor(() => {
+    const faviconLink = container.querySelector("link[rel=icon]");
+    expect(faviconLink).toHaveAttribute("href", LOAD_COMPLETE_FAVICON);
+  });
+};

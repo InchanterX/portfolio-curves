@@ -1,0 +1,96 @@
+import _ from "underscore";
+
+import { createMockMetadata } from "__support__/metadata";
+import * as Lib from "metabase-lib";
+import { DEFAULT_TEST_QUERY, SAMPLE_PROVIDER } from "metabase-lib/test-helpers";
+import Question from "metabase-lib/v1/Question";
+import { createSampleDatabase } from "metabase-types/api/mocks/presets";
+
+import { askQuestion, newQuestion, question, table } from "./questions";
+
+const metadata = createMockMetadata({
+  databases: [createSampleDatabase()],
+});
+
+const orders_raw_card = {
+  id: 1,
+  name: "Raw orders data",
+  display: "table",
+  visualization_settings: {},
+  can_write: true,
+  dataset_query: Lib.toLegacyQuery(
+    Lib.createTestQuery(SAMPLE_PROVIDER, DEFAULT_TEST_QUERY),
+  ),
+};
+
+describe("urls > questions", () => {
+  describe("question", () => {
+    const adhocUrl =
+      "/question#eyJkYXRhc2V0X3F1ZXJ5Ijp7ImRhdGFiYXNlIjoxLCJsaWIvdHlwZSI6Im1icWwvcXVlcnkiLCJzdGFnZXMiOlt7ImxpYi90eXBlIjoibWJxbC5zdGFnZS9tYnFsIiwic291cmNlLXRhYmxlIjoyfV19LCJkaXNwbGF5IjoidGFibGUiLCJuYW1lIjoiUmF3IG9yZGVycyBkYXRhIiwicGFyYW1ldGVyVmFsdWVzIjp7fSwidmlzdWFsaXphdGlvbl9zZXR0aW5ncyI6e319";
+
+    // Covered a lot in query_builder/actions.spec.js, just very basic cases here
+    // (currently getUrl has logic that is strongly tied to the logic query builder Redux actions)
+    describe("question(originalQuestion?)", () => {
+      it("returns URL with ID for saved question", () => {
+        const q = new Question({ ...orders_raw_card, id: 1 }, metadata);
+        expect(question(q)).toBe("/question/1-raw-orders-data");
+      });
+
+      it("returns a URL with hash for an unsaved question", () => {
+        const q = new Question(_.omit(orders_raw_card, "id"), metadata);
+        expect(question(q)).toBe(adhocUrl);
+      });
+    });
+
+    it("should avoid generating URLs with transient IDs", () => {
+      const q = new Question(
+        { ...orders_raw_card, id: "foo", original_card_id: "bar" },
+        metadata,
+      );
+
+      expect(question(q)).toBe(adhocUrl);
+    });
+  });
+
+  describe("table", () => {
+    it("builds a slugged URL from id and name", () => {
+      expect(table({ id: 2, name: "Orders" })).toBe("/table/2-orders");
+    });
+
+    it("slugifies multi-word and special-character names", () => {
+      expect(table({ id: 10, name: "People & Places!" })).toBe(
+        "/table/10-people-places",
+      );
+    });
+
+    it("omits the slug when no name is given", () => {
+      expect(table({ id: 2 })).toBe("/table/2");
+      expect(table({ id: 2, name: null })).toBe("/table/2");
+    });
+  });
+
+  describe("newQuestion", () => {
+    it("should return the correct url", () => {
+      const hash =
+        "eyJkYXRhc2V0X3F1ZXJ5Ijp7ImRhdGFiYXNlIjpudWxsLCJsaWIvdHlwZSI6Im1icWwvcXVlcnkiLCJzdGFnZXMiOlt7ImxpYi90eXBlIjoibWJxbC5zdGFnZS9tYnFsIiwic291cmNlLXRhYmxlIjpudWxsfV19LCJkaXNwbGF5IjoidGFibGUiLCJwYXJhbWV0ZXJWYWx1ZXMiOnt9LCJ2aXN1YWxpemF0aW9uX3NldHRpbmdzIjp7fX0=";
+
+      const draft = Question.create({ metadata: createMockMetadata() });
+
+      expect(newQuestion(draft, { mode: "query" })).toBe(
+        `/question/query#${hash}`,
+      );
+      expect(newQuestion(draft, { mode: "notebook" })).toBe(
+        `/question/notebook#${hash}`,
+      );
+      expect(newQuestion(draft, { mode: "view" })).toBe(
+        `/question/view#${hash}`,
+      );
+    });
+  });
+
+  describe("askQuestion", () => {
+    it("should return ask url", () => {
+      expect(askQuestion()).toBe("/question/ask");
+    });
+  });
+});

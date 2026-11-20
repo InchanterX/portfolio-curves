@@ -1,0 +1,36 @@
+import _ from "underscore";
+
+import type Question from "metabase-lib/v1/Question";
+import type { FieldTypeInfo } from "metabase-lib/v1/types/utils/isa";
+import {
+  isBoolean,
+  isInteger,
+  isPK,
+  isString,
+} from "metabase-lib/v1/types/utils/isa";
+import type { DatasetColumn } from "metabase-types/api";
+import type { ModelIndex } from "metabase-types/api/modelIndexes";
+
+const hasSingleIntegerPk = (model?: Question) => {
+  const pkFields = model
+    ?.getResultMetadata()
+    ?.filter((field: DatasetColumn) => isPK(field));
+
+  return pkFields?.length === 1 && isInteger(pkFields[0]);
+};
+
+export const canIndexField = (
+  field: FieldTypeInfo,
+  model: Question,
+): boolean => {
+  return !!(isString(field) && !isBoolean(field) && hasSingleIntegerPk(model));
+};
+
+export const getPkRef = (fields?: DatasetColumn[]) =>
+  fields?.find(isPK)?.field_ref;
+
+export const fieldHasIndex = (
+  modelIndexes: ModelIndex[] | undefined,
+  field: Pick<DatasetColumn, "field_ref">,
+) =>
+  !!modelIndexes?.some((index) => _.isEqual(index.value_ref, field.field_ref));

@@ -1,0 +1,292 @@
+import { type UnknownAction, createReducer } from "@reduxjs/toolkit";
+
+import { actionApi } from "metabase/api";
+import { combineReducers } from "metabase/redux";
+import { CARD_UPDATED } from "metabase/redux/cards";
+import { SET_PARAMETER_VALUES, initialize } from "metabase/redux/dashboard";
+import type { Card, DashCardId } from "metabase-types/api";
+
+import type {
+  removeParameter,
+  resetParameters,
+  setParameterValue,
+} from "./actions";
+import {
+  REMOVE_CARD_FROM_DASH,
+  REMOVE_PARAMETER,
+  RESET_PARAMETERS,
+  SET_PARAMETER_VALUE,
+  UNDO_REMOVE_CARD_FROM_DASH,
+  addCardToDash,
+  addManyCardsToDash,
+  dashboardLayoutFetched,
+  fetchDashboardFulfilled,
+  markNewCardSeen,
+  onReplaceAllDashCardVisualizationSettings,
+  onUpdateDashCardColumnSettings,
+  onUpdateDashCardVisualizationSettings,
+  setDashCardAttributes,
+  setMultipleDashCardAttributes,
+} from "./actions/core";
+import { tabsReducer } from "./actions/tabs";
+import { INITIAL_DASHBOARD_STATE } from "./constants";
+import {
+  autoApplyFilters,
+  dashboardId,
+  dashboards,
+  dashcardData,
+  editingDashboard,
+  isAddParameterPopoverOpen,
+  isNavigatingBackToDashboard,
+  linkTargets,
+  loadingControls,
+  loadingDashCards,
+  missingActionParameters,
+  parameterValues,
+  sidebar,
+  slowCards,
+  timelineEvents,
+} from "./reducers-typed";
+import { calculateDashCardRowAfterUndo } from "./utils";
+
+type PayloadFromThunkActionCreator<T extends (...args: any[]) => any> =
+  ReturnType<T> extends (...args: any[]) => Promise<infer TResult>
+    ? TResult extends { payload: infer TPayload }
+      ? TPayload
+      : never
+    : never;
+
+type DraftParameterValuesState =
+  typeof INITIAL_DASHBOARD_STATE.draftParameterValues;
+
+const dashcards = createReducer(
+  INITIAL_DASHBOARD_STATE.dashcards,
+  (builder) => {
+    builder
+      .addCase(fetchDashboardFulfilled, (state, action) => ({
+        ...state,
+        ...action.payload.entities.dashcard,
+      }))
+      .addCase(dashboardLayoutFetched, (state, { payload }) => ({
+        ...state,
+        ...payload.dashcard,
+      }))
+      .addCase(
+        setDashCardAttributes,
+        (state, { payload: { id, attributes } }) => {
+          const dashcard = state[id];
+          if (!dashcard) {
+            return;
+          }
+          Object.assign(dashcard, attributes);
+          dashcard.isDirty = true;
+        },
+      )
+      .addCase(
+        setMultipleDashCardAttributes,
+        (state, { payload: { dashcards } }) => {
+          dashcards.forEach(({ id, attributes }) => {
+            const dashcard = state[id];
+            if (!dashcard) {
+              return;
+            }
+            Object.assign(dashcard, attributes);
+            dashcard.isDirty = true;
+          });
+        },
+      )
+      .addCase(
+        onUpdateDashCardVisualizationSettings,
+        (state, { payload: { id, settings } }) => {
+          const dashcard = state[id];
+          if (!dashcard) {
+            return;
+          }
+          Object.assign((dashcard.visualization_settings ??= {}), settings);
+          dashcard.isDirty = true;
+        },
+      )
+      .addCase(
+        onUpdateDashCardColumnSettings,
+        (state, { payload: { column, id, settings } }) => {
+          const dashcard = state[id];
+          if (!dashcard) {
+            return;
+          }
+          const visualizationSettings = (dashcard.visualization_settings ??=
+            {});
+          const columnSettings = (visualizationSettings.column_settings ??= {});
+          columnSettings[column] = { ...columnSettings[column], ...settings };
+          dashcard.isDirty = true;
+        },
+      )
+      .addCase(
+        onReplaceAllDashCardVisualizationSettings,
+        (state, { payload: { id, settings } }) => {
+          const dashcard = state[id];
+          if (!dashcard) {
+            return;
+          }
+          // Payload settings may be null, while the dashcard field is only optional
+          Object.assign(dashcard, { visualization_settings: settings });
+          dashcard.isDirty = true;
+        },
+      )
+      .addCase(addCardToDash, (state, { payload: dashcard }) => {
+        // @ts-expect-error -- NewDashboardCard is a partial StoreDashcard, safe to assign here
+        state[dashcard.id] = {
+          ...dashcard,
+          isAdded: true,
+          justAdded: true,
+        };
+      })
+      .addCase(addManyCardsToDash, (state, { payload: dashcards }) => {
+        dashcards.forEach((dc, index) => {
+          // @ts-expect-error -- NewDashboardCard is a partial StoreDashcard, safe to assign here
+          state[dc.id] = {
+            ...dc,
+            isAdded: true,
+            justAdded: index === 0,
+          };
+        });
+      })
+      .addCase<
+        string,
+        {
+          type: string;
+          payload: { dashcardId: DashCardId };
+        }
+      >(REMOVE_CARD_FROM_DASH, (state, { payload: { dashcardId } }) => {
+        if (state[dashcardId]) {
+          state[dashcardId].isRemoved = true;
+        }
+      })
+      .addCase<
+        string,
+        {
+          type: string;
+          payload: { dashcardId: DashCardId };
+        }
+      >(UNDO_REMOVE_CARD_FROM_DASH, (state, { payload: { dashcardId } }) => {
+        if (!state[dashcardId]) {
+          return;
+        }
+        state[dashcardId].isRemoved = false;
+        state[dashcardId].row = calculateDashCardRowAfterUndo(
+          state[dashcardId].row,
+        );
+      })
+      .addCase(markNewCardSeen, (state, { payload: dashcardId }) => {
+        if (state[dashcardId]) {
+          state[dashcardId].justAdded = false;
+        }
+      })
+      .addCase<
+        string,
+        { type: string; payload: { object: Card | null | undefined } }
+      >(CARD_UPDATED, (state, { payload: { object: card } }) => {
+        if (!card) {
+          return;
+        }
+        Object.values(state).forEach((dashcard) => {
+          if (dashcard.card?.id === card.id) {
+            Object.assign(dashcard.card, card);
+          }
+        });
+      })
+      .addMatcher(
+        actionApi.endpoints.updateAction.matchFulfilled,
+        (state, { payload: action }) => {
+          Object.values(state).forEach((dashcard) => {
+            if (!("action" in dashcard) || dashcard.action?.id !== action.id) {
+              return;
+            }
+            Object.assign(dashcard.action, action, {
+              database_enabled_actions:
+                dashcard.action.database_enabled_actions || false,
+            });
+          });
+        },
+      );
+  },
+);
+
+const draftParameterValues = createReducer(
+  INITIAL_DASHBOARD_STATE.draftParameterValues,
+  (builder) => {
+    builder
+      .addCase(initialize, (state, { payload: { clearCache = true } = {} }) => {
+        return clearCache ? {} : state;
+      })
+      .addCase(fetchDashboardFulfilled, (state, { payload }) =>
+        payload.preserveParameters && !payload.dashboard.auto_apply_filters
+          ? state
+          : payload.parameterValues,
+      )
+      .addCase<
+        string,
+        {
+          type: string;
+          payload: PayloadFromThunkActionCreator<typeof setParameterValue>;
+        }
+      >(SET_PARAMETER_VALUE, (state, { payload: { id, value } }) => {
+        // Skip equal values, so `undefined` for a missing filter
+        // doesn't add a key and show a fake unapplied change
+        if (state[id] !== value) {
+          state[id] = value;
+        }
+      })
+      .addCase<string, { type: string; payload: DraftParameterValuesState }>(
+        SET_PARAMETER_VALUES,
+        (_state, { payload }) => payload,
+      )
+      .addCase<
+        string,
+        {
+          type: string;
+          payload: PayloadFromThunkActionCreator<typeof resetParameters>;
+        }
+      >(RESET_PARAMETERS, (state, { payload: parameters }) =>
+        parameters.forEach((parameter) => {
+          state[parameter.id] = parameter.value;
+        }),
+      )
+      .addCase<
+        string,
+        {
+          type: string;
+          payload: PayloadFromThunkActionCreator<typeof removeParameter>;
+        }
+      >(REMOVE_PARAMETER, (state, { payload: { id } }) => {
+        delete state[id];
+      });
+  },
+);
+
+const combinedDashboardReducer = combineReducers({
+  dashboardId,
+  missingActionParameters,
+  autoApplyFilters,
+  slowCards,
+  isNavigatingBackToDashboard,
+  isAddParameterPopoverOpen,
+  editingDashboard,
+  loadingControls,
+  sidebar,
+  timelineEvents,
+  parameterValues,
+  dashboards,
+  loadingDashCards,
+  dashcards,
+  dashcardData,
+  linkTargets,
+  draftParameterValues,
+  // Combined reducer needs to init state for every slice
+  selectedTabId: (state = INITIAL_DASHBOARD_STATE.selectedTabId) => state,
+  tabDeletions: (state = INITIAL_DASHBOARD_STATE.tabDeletions) => state,
+});
+
+export const dashboardReducers = (
+  state = INITIAL_DASHBOARD_STATE,
+  action: UnknownAction,
+) => tabsReducer(combinedDashboardReducer(state, action), action);

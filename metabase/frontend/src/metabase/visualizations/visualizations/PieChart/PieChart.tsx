@@ -1,0 +1,199 @@
+/* eslint-disable @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- FIXME: any-typed values */
+import type { EChartsType } from "echarts/core";
+import { type MouseEvent, useCallback, useMemo, useRef, useState } from "react";
+
+import { isNotNull } from "metabase/utils/types";
+import { ChartWithLegend } from "metabase/visualizations/components/ChartWithLegend";
+import { ResponsiveEChartsRenderer } from "metabase/visualizations/components/EChartsRenderer";
+import { getTooltipOption } from "metabase/visualizations/echarts/pie/tooltip";
+import { useBrowserRenderingContext } from "metabase/visualizations/hooks/use-browser-rendering-context";
+import { useLegendHiddenSeries } from "metabase/visualizations/hooks/use-legend-hidden-series";
+import type { VisualizationProps } from "metabase/visualizations/types";
+import { useTooltipMouseLeave } from "metabase/visualizations/visualizations/CartesianChart/use-tooltip-mouse-leave";
+import {
+  extractRemappings,
+  getArrayFromMapValues,
+  getPieChartFormatters,
+  getPieChartModel,
+  getPieChartOption,
+  useCloseTooltipOnScroll,
+  usePieChartValuesColorsClasses,
+} from "metabase/viz-core";
+
+import S from "./PieChart.module.css";
+import { PIE_CHART_DEFINITION } from "./definition";
+import { useChartEvents } from "./use-chart-events";
+
+function PieChartComponent(props: VisualizationProps) {
+  const { fontFamily, rawSeries, settings, onRender, isDashboard, isDocument } =
+    props;
+  const hoveredIndex = props.hovered?.index;
+  const hoveredSliceKeyPath = props.hovered?.pieSliceKeyPath;
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<EChartsType>(undefined);
+  const [sideLength, setSideLength] = useState(0);
+
+  const [hiddenSlices, toggleSliceVisibility] = useLegendHiddenSeries<
+    string | number
+  >(settings["legend.position"]);
+
+  const showWarning = useCallback(
+    (warning: string) => onRender({ warnings: [warning] }),
+    [onRender],
+  );
+
+  const renderingContext = useBrowserRenderingContext({
+    fontFamily,
+    isDashboard,
+  });
+  const seriesToRender = useMemo(
+    () => extractRemappings(rawSeries),
+    [rawSeries],
+  );
+
+  const chartModel = useMemo(
+    () =>
+      getPieChartModel(
+        seriesToRender,
+        settings,
+        Array.from(hiddenSlices),
+        renderingContext,
+        showWarning,
+      ),
+    [seriesToRender, settings, hiddenSlices, renderingContext, showWarning],
+  );
+  const formatters = useMemo(
+    () => getPieChartFormatters(chartModel, settings),
+    [chartModel, settings],
+  );
+  const option = useMemo(
+    () => ({
+      ...getPieChartOption(
+        chartModel,
+        formatters,
+        settings,
+        renderingContext,
+        sideLength,
+        hoveredIndex,
+        hoveredSliceKeyPath,
+      ),
+      tooltip: getTooltipOption(chartModel, formatters, containerRef),
+    }),
+    [
+      chartModel,
+      formatters,
+      settings,
+      renderingContext,
+      sideLength,
+      hoveredIndex,
+      hoveredSliceKeyPath,
+    ],
+  );
+
+  const valuesColorsCss = usePieChartValuesColorsClasses(chartModel);
+
+  const handleInit = useCallback((chart: EChartsType) => {
+    chartRef.current = chart;
+  }, []);
+
+  const handleResize = useCallback(
+    (width: number, height: number) => setSideLength(Math.min(width, height)),
+    [],
+  );
+
+  const eventHandlers = useChartEvents(props, chartRef, chartModel);
+
+  const slices = useMemo(
+    () => getArrayFromMapValues(chartModel.sliceTree),
+    [chartModel.sliceTree],
+  );
+  const legendTitles = useMemo(
+    () =>
+      slices
+        .filter((s) => s.includeInLegend)
+        .map((s) => {
+          const label = s.name;
+
+          // Hidden slices don't have a percentage
+          const sliceHidden = s.normalizedPercentage === 0;
+          const percentDisabled =
+            settings["pie.percent_visibility"] !== "legend" &&
+            settings["pie.percent_visibility"] !== "both";
+
+          if (sliceHidden || percentDisabled) {
+            return [label];
+          }
+
+          return [
+            label,
+            formatters.formatPercent(s.normalizedPercentage, "legend"),
+          ];
+        }),
+    [formatters, settings, slices],
+  );
+
+  const hiddenSlicesLegendIndices = slices
+    .filter((s) => s.includeInLegend)
+    .map((s, index) => (hiddenSlices.has(s.key) ? index : null))
+    .filter(isNotNull);
+
+  const legendColors = slices
+    .filter((s) => s.includeInLegend)
+    .map((s) => s.color);
+
+  const onHoverChange = (hoverData: any) =>
+    props.onHoverChange(
+      hoverData && {
+        ...hoverData,
+        pieLegendHoverIndex: hoverData.index,
+      },
+    );
+
+  const handleToggleSeriesVisibility = (
+    _event: MouseEvent,
+    sliceIndex: number,
+  ) => {
+    const slice = slices[sliceIndex];
+    const willShowSlice = hiddenSlices.has(slice.key);
+    const hasMoreVisibleSlices = slices.length - hiddenSlices.size > 1;
+    if (hasMoreVisibleSlices || willShowSlice) {
+      toggleSliceVisibility(slice.key);
+    }
+  };
+
+  useCloseTooltipOnScroll(chartRef);
+  useTooltipMouseLeave(chartRef, onHoverChange, containerRef);
+
+  return (
+    <ChartWithLegend
+      legendTitles={legendTitles}
+      legendHiddenIndices={hiddenSlicesLegendIndices}
+      legendColors={legendColors}
+      legendPosition={settings["legend.position"]}
+      onHoverChange={onHoverChange}
+      className={props.className}
+      chartClassName={S.PieChartContainer}
+      gridSize={props.gridSize}
+      hovered={props.hovered}
+      isDashboard={isDashboard}
+      onToggleSeriesVisibility={handleToggleSeriesVisibility}
+      isDocument={isDocument}
+    >
+      <ResponsiveEChartsRenderer
+        ref={containerRef}
+        option={option}
+        onInit={handleInit}
+        onResize={handleResize}
+        eventHandlers={eventHandlers}
+        // By default this is `true` for other charts, however for the pie chart
+        // we need it to be `false`, otherwise echarts will bug out and be stuck
+        // in emphasis state after hovering a slice
+        notMerge={false}
+      />
+      {valuesColorsCss}
+    </ChartWithLegend>
+  );
+}
+
+export const PieChart = Object.assign(PieChartComponent, PIE_CHART_DEFINITION);
