@@ -4,6 +4,58 @@ CREATE SCHEMA app;
 CREATE SCHEMA calc;
 CREATE SCHEMA audit;
 CREATE SCHEMA mart;
+CREATE SCHEMA auth;
+
+CREATE TABLE auth.user_account (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    email varchar(320) NOT NULL,
+    display_name varchar(256) NOT NULL,
+    password_hash text NOT NULL,
+    role varchar(16) NOT NULL DEFAULT 'viewer',
+    status varchar(16) NOT NULL DEFAULT 'pending',
+    email_confirmed_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT pk_user_account PRIMARY KEY (id),
+    CONSTRAINT ck_user_account_email CHECK (email = trim(email) AND length(email) > 0),
+    CONSTRAINT ck_user_account_display_name CHECK (length(trim(display_name)) > 0),
+    CONSTRAINT ck_user_account_password_hash CHECK (length(trim(password_hash)) > 0),
+    CONSTRAINT ck_user_account_role CHECK (role IN ('viewer', 'editor')),
+    CONSTRAINT ck_user_account_status CHECK (status IN ('pending', 'active', 'disabled')),
+    CONSTRAINT ck_user_account_confirmation CHECK (status <> 'active' OR email_confirmed_at IS NOT NULL),
+    CONSTRAINT ck_user_account_times CHECK (updated_at >= created_at AND (email_confirmed_at IS NULL OR email_confirmed_at >= created_at))
+);
+CREATE UNIQUE INDEX uq_user_account_email ON auth.user_account(lower(email));
+CREATE TABLE auth.user_session (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    user_id bigint NOT NULL,
+    token_hash varchar(64) NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    revoked_at timestamptz,
+    CONSTRAINT pk_user_session PRIMARY KEY (id),
+    CONSTRAINT fk_user_session_user FOREIGN KEY (user_id) REFERENCES auth.user_account(id),
+    CONSTRAINT uq_user_session_token UNIQUE (token_hash),
+    CONSTRAINT ck_user_session_hash CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_user_session_times CHECK (expires_at > created_at AND (revoked_at IS NULL OR revoked_at >= created_at))
+);
+CREATE INDEX ix_user_session_user ON auth.user_session(user_id);
+CREATE TABLE auth.action_token (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    user_id bigint NOT NULL,
+    purpose varchar(32) NOT NULL,
+    token_hash varchar(64) NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    used_at timestamptz,
+    CONSTRAINT pk_action_token PRIMARY KEY (id),
+    CONSTRAINT fk_action_token_user FOREIGN KEY (user_id) REFERENCES auth.user_account(id),
+    CONSTRAINT uq_action_token_hash UNIQUE (token_hash),
+    CONSTRAINT ck_action_token_purpose CHECK (purpose IN ('verify_email', 'reset_password')),
+    CONSTRAINT ck_action_token_hash CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_action_token_times CHECK (expires_at > created_at AND (used_at IS NULL OR used_at >= created_at))
+);
+CREATE INDEX ix_action_token_user ON auth.action_token(user_id);
 
 CREATE TABLE ref.bucket_set (
     id bigint GENERATED ALWAYS AS IDENTITY,
@@ -90,11 +142,11 @@ CREATE TABLE app.methodology_version (
     extrapolation_method varchar(64),
     nearest_method varchar(64),
     rate_convention varchar(64),
-    ec_formula varchar(128),
-    portfolio_params jsonb,
     source_document varchar(512),
     created_by varchar(128) NOT NULL,
+    created_by_user_id bigint,
     created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_methodology_author FOREIGN KEY (created_by_user_id) REFERENCES auth.user_account(id),
     CONSTRAINT pk_methodology_version PRIMARY KEY (id),
     CONSTRAINT uq_methodology_version UNIQUE (code, version_no),
     CONSTRAINT uq_methodology_bucket_set UNIQUE (id, bucket_set_id),
@@ -127,7 +179,9 @@ CREATE TABLE app.scenario (
     is_predefined boolean NOT NULL DEFAULT false,
     is_active boolean NOT NULL DEFAULT true,
     created_by varchar(128) NOT NULL,
+    created_by_user_id bigint,
     created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_scenario_author FOREIGN KEY (created_by_user_id) REFERENCES auth.user_account(id),
     CONSTRAINT pk_scenario PRIMARY KEY (id),
     CONSTRAINT uq_scenario_version UNIQUE (code, version_no),
     CONSTRAINT ck_scenario_version CHECK (version_no > 0),
@@ -135,61 +189,21 @@ CREATE TABLE app.scenario (
     CONSTRAINT ck_scenario_params CHECK (params IS NULL OR jsonb_typeof(params) = 'object'),
     CONSTRAINT ck_scenario_custom CHECK (shift_type <> 'custom_by_bucket' OR params IS NOT NULL)
 );
-CREATE UNIQUE INDEX uq_scenario_active ON app.scenario(code) WHERE is_active;
-CREATE TABLE app.portfolio_snapshot (
-    id bigint GENERATED ALWAYS AS IDENTITY,
-    as_of_date date NOT NULL,
-    status varchar(16) NOT NULL DEFAULT 'uploaded',
-    source_file_name varchar(512) NOT NULL,
-    source_file_sha256 varchar(64) NOT NULL,
-    validation_errors jsonb,
-    uploaded_by varchar(128) NOT NULL,
-    uploaded_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT pk_portfolio_snapshot PRIMARY KEY (id),
-    CONSTRAINT ck_portfolio_status CHECK (status IN ('uploaded', 'validated', 'rejected')),
-    CONSTRAINT ck_portfolio_hash CHECK (source_file_sha256 ~ '^[0-9a-f]{64}$')
-);
-CREATE TABLE app.instrument (
-    id bigint GENERATED ALWAYS AS IDENTITY,
-    snapshot_id bigint NOT NULL,
-    external_id varchar(128) NOT NULL,
-    instrument_type varchar(32) NOT NULL,
-    balance_side varchar(16) NOT NULL,
-    currency_code varchar(3) NOT NULL,
-    notional numeric(24,8) NOT NULL,
-    rate_type varchar(16) NOT NULL,
-    rate_pct numeric(18,10),
-    maturity_date date,
-    next_reprice_date date,
-    extra jsonb,
-    CONSTRAINT pk_instrument PRIMARY KEY (id),
-    CONSTRAINT uq_instrument_external UNIQUE (snapshot_id, external_id),
-    CONSTRAINT uq_instrument_snapshot UNIQUE (id, snapshot_id),
-    CONSTRAINT fk_instrument_snapshot FOREIGN KEY (snapshot_id) REFERENCES app.portfolio_snapshot(id),
-    CONSTRAINT ck_instrument_type CHECK (instrument_type IN ('loan', 'term_deposit', 'nmd', 'bond', 'swap', 'other')),
-    CONSTRAINT ck_instrument_side CHECK (balance_side IN ('asset', 'liability', 'off_balance')),
-    CONSTRAINT ck_instrument_rate_type CHECK (rate_type IN ('fixed', 'floating')),
-    CONSTRAINT ck_instrument_currency CHECK (currency_code ~ '^[A-Z]{3}$')
-);
-CREATE TABLE app.instrument_cashflow (
-    id bigint GENERATED ALWAYS AS IDENTITY,
-    instrument_id bigint NOT NULL,
-    flow_date date NOT NULL,
-    cashflow_type varchar(16) NOT NULL,
-    amount numeric(24,8) NOT NULL,
-    CONSTRAINT pk_instrument_cashflow PRIMARY KEY (id),
-    CONSTRAINT fk_cashflow_instrument FOREIGN KEY (instrument_id) REFERENCES app.instrument(id),
-    CONSTRAINT ck_cashflow_type CHECK (cashflow_type IN ('principal', 'interest', 'spread'))
-);
-CREATE INDEX ix_cashflow_instrument_date ON app.instrument_cashflow(instrument_id, flow_date);
+CREATE UNIQUE INDEX uq_scenario_active ON app.scenario((CASE WHEN is_active THEN code END));
 CREATE TABLE audit.audit_log (
     id bigint GENERATED ALWAYS AS IDENTITY,
     occurred_at timestamptz NOT NULL DEFAULT now(),
     actor varchar(128) NOT NULL,
+    actor_user_id bigint,
     action varchar(64) NOT NULL,
     entity_type varchar(64) NOT NULL,
     entity_id bigint NOT NULL,
     details jsonb,
+    CONSTRAINT fk_audit_actor FOREIGN KEY (actor_user_id) REFERENCES auth.user_account(id),
     CONSTRAINT pk_audit_log PRIMARY KEY (id)
 );
 CREATE INDEX ix_audit_log_entity ON audit.audit_log(entity_type, entity_id);
+
+CREATE INDEX ix_methodology_author ON app.methodology_version(created_by_user_id);
+CREATE INDEX ix_scenario_author ON app.scenario(created_by_user_id);
+CREATE INDEX ix_audit_actor ON audit.audit_log(actor_user_id);

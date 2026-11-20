@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+#
+# Cross-version migration testing for Metabase
+#
+# Usage:
+#   ./test.sh --source v0.58.6 --target v0.58.7
+#
+# Edition (OSS/EE) is inferred from version prefix (v0.x = OSS, v1.x = EE).
+# Direction (upgrade/downgrade) is inferred from version comparison.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$SCRIPT_DIR"
+
+# Defaults
+SOURCE_VERSION=""
+TARGET_VERSION=""
+METABASE_PORT="${METABASE_PORT:-3000}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
+GRACE_PERIOD="${GRACE_PERIOD:-3}"
+CYPRESS_FAILURES_RECORDED=0
+HEAD_IMAGE=""
+HEAD_JAR="/tmp/metabase-head-jar/metabase.jar"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+log() { echo -e "${GREEN}[cross-version]${NC} $*"; }
+warn() { echo -e "${YELLOW}[cross-version]${NC} $*"; }
+error() { echo -e "${RED}[cross-version]${NC} $*" >&2; }
+
+usage() {
+  cat <<EOF
+Usage: $0 --source VERSION --target VERSION
+
+Options:
+  --source VERSION    Source version (e.g., v0.58.6 for OSS, v1.58.6 for EE)
+  --target VERSION    Target version (e.g., v0.58.7 for OSS, v1.58.7 for EE)
+  --help              Show this help
+
+Examples:
+  $0 --source v0.58.6 --target v0.58.7    # Upgrade test (OSS)
+  $0 --source v0.58.7 --target v0.58.6    # Downgrade test (OSS)
+  $0 --source v1.58.6 --target v1.58.7    # Upgrade test (EE)
+EOF
+  exit 1
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --source) SOURCE_VERSION="$2"; shift 2 ;;
+    --target) TARGET_VERSION="$2"; shift 2 ;;
+    --help) usage ;;
+    *) error "Unknown option: $1"; usage ;;
+  esac
+done
+
+if [[ -z "$SOURCE_VERSION" || -z "$TARGET_VERSION" ]]; then
+  error "Both --source and --target are required"
+  usage
+fi
+
+# CLI wrapper for version helpers (uses tested TypeScript implementation)
+cli() {
+  bun "$SCRIPT_DIR/cli.ts" "$@"
+}
+
+run_e2e() {
+  local phase="$1"
+  local version="$2"
+  local major specs_dir
+
+  major=$(cli major "$version")
+  specs_dir="$REPO_ROOT/e2e/cross-version/${major}"
+  if [[ ! -d "$specs_dir" ]]; then
+    local closest="" closest_dist=999
+    for dir in "$REPO_ROOT"/e2e/cross-version/[0-9]*/; do
+      # Skip the literal pattern when the glob matches no numbered folders
+      [[ -d "$dir" ]] || continue
+      local v=$(basename "$dir")
+      (( v < major )) && continue
+      local dist=$(( v - major ))
+      if (( dist < closest_dist )); then
+        closest_dist=$dist
+        closest="$dir"
+      fi
+    done
+    if [[ -n "$closest" ]]; then
+      specs_dir="${closest%/}"
+      log "No exact specs for v${major} — using closest: ${specs_dir##*/}/"
+    else
+      specs_dir="$REPO_ROOT/e2e/cross-version/latest"
+      log "No exact specs for v${major} — falling back to latest/"
+    fi
+  else
+    log "Found exact specs for v${major}"
+  fi
+
+  log "Running @${phase} e2e tests for ${version} from: e2e/cross-version/${specs_dir##*/}/"
+  local recorded_before
+  recorded_before=$(count_recorded_failures)
+  if ! CYPRESS_SPEC_PATTERN="${specs_dir}/**/*.cy.spec.ts" \
+    "$REPO_ROOT/e2e/cross-version/run.sh" --phase "$phase"; then
+    if (( $(count_recorded_failures) > recorded_before )); then
+      CYPRESS_FAILURES_RECORDED=1
+    fi
+    return 1
+  fi
+}
+
+count_recorded_failures() {
+  if [[ -n "${QUARANTINE_FAILURES_FILE:-}" && -f "$QUARANTINE_FAILURES_FILE" ]]; then
+    wc -l < "$QUARANTINE_FAILURES_FILE" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+
+wait_for_health() {
+  local timeout="$1"
+  local start_time=$(date +%s)
+
+  log "Waiting for Metabase to be healthy (timeout: ${timeout}s)..."
+
+  while true; do
+    local current_time=$(date +%s)
+    local elapsed=$((current_time - start_time))
+
+    if (( elapsed >= timeout )); then
+      error "Health check timed out after ${timeout}s"
+      return 1
+    fi
+
+    if curl -sf "http://localhost:${METABASE_PORT}/api/health" > /dev/null 2>&1; then
+      local response=$(curl -sf "http://localhost:${METABASE_PORT}/api/health")
+      if [[ "$response" == '{"status":"ok"}' ]]; then
+        log "Health check passed after ${elapsed}s"
+        return 0
+      fi
+    fi
+
+    sleep 2
+  done
+}
+
+# The HEAD Docker image has version "vUNKNOWN" in its version.properties,
+# which causes `migrate down` to fail with a NullPointerException when trying
+# to determine the current major version. To work around this, we extract the
+# JAR, replace version.properties with the upcoming version, and mount the
+# modified JAR.
+#
+# HEAD is the next major version (CURRENT_VERSION + 1).
+#
+# See DEV-1636 for a potential backend fix that would make this unnecessary.
+patch_head_jar() {
+  local image="$1"
+  if [[ -z "${CURRENT_VERSION:-}" ]]; then
+    error "CURRENT_VERSION must be set when testing HEAD"
+    exit 1
+  fi
+  local next_version=$((CURRENT_VERSION + 1))
+  local upcoming_version="v1.${next_version}.0"
+  local work_dir="/tmp/metabase-head-jar"
+
+  log "HEAD JAR needs patching (version.properties says 'vUNKNOWN', setting to $upcoming_version)"
+  rm -rf "$work_dir"
+  mkdir -p "$work_dir"
+
+  # Extract JAR from container (copy to host with proper permissions)
+  docker create --name metabase-jar-extract "$image" >/dev/null
+  docker cp metabase-jar-extract:/app/metabase.jar "$HEAD_JAR"
+  docker rm metabase-jar-extract >/dev/null
+
+  # Create version.properties with upcoming version and update the JAR
+  echo "tag=$upcoming_version" > "$work_dir/version.properties"
+  echo "hash=HEAD" >> "$work_dir/version.properties"
+  echo "date=$(date +%Y-%m-%d)" >> "$work_dir/version.properties"
+  (cd "$work_dir" && zip -u metabase.jar version.properties >/dev/null)
+
+  log "HEAD JAR patched"
+}
+
+compose_files_for() {
+  local image="$1"
+  COMPOSE_FILES=(-f docker-compose.yml)
+  if [[ -n "$HEAD_IMAGE" && "$image" == "$HEAD_IMAGE" ]]; then
+    COMPOSE_FILES+=(-f docker-compose.head.yml)
+  fi
+}
+
+# Start Metabase with a specific image
+start_metabase() {
+  local image="$1"
+  log "Starting Metabase with image: $image"
+
+  local COMPOSE_FILES
+  compose_files_for "$image"
+
+  METABASE_IMAGE="$image" METABASE_PORT="$METABASE_PORT" \
+    docker compose "${COMPOSE_FILES[@]}" up -d --quiet-pull
+}
+
+# Docker deletes a container's logs when the container is removed, and both
+# stop_metabase and cleanup remove containers. Append them to a file first so
+# they are still around after the run (CI prints these on failure).
+save_logs() {
+  local service="$1"
+  local label="$2"
+
+  {
+    echo "===== ${service} — ${label} ====="
+    docker compose logs --no-color "$service" 2>&1 || true
+    echo
+  } >> "$LOG_DIR/docker-${service}.log"
+}
+
+# Stop Metabase (but keep postgres)
+stop_metabase() {
+  local label="$1"
+  log "Stopping Metabase container..."
+  save_logs metabase "$label"
+  docker compose stop metabase
+  docker compose rm -f metabase
+}
+
+# Get edition prefix from version (0 for OSS, 1 for EE)
+get_edition_prefix() {
+  local version="$1"
+  if [[ "$version" == "HEAD" ]]; then
+    echo "1"  # HEAD is EE
+  elif [[ "$version" =~ ^v([01])\. ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    error "Cannot determine edition from version: $version"
+    return 1
+  fi
+}
+
+# https://www.metabase.com/docs/latest/installation-and-operation/upgrading-metabase#using-the-migrate-down-command
+# Run a single migrate down step (rolls back exactly one major version)
+# This function is idempotent - it takes a version string and handles everything internally.
+migrate_down_step() {
+  local version="$1"
+  local image COMPOSE_FILES
+
+  # Resolve image from version
+  image=$(cli image "$version") || return 1
+  compose_files_for "$image"
+
+  log "Running 'migrate down' for version: $version (image: $image)"
+
+  local output
+  local exit_code=0
+
+  output=$(METABASE_IMAGE="$image" docker compose "${COMPOSE_FILES[@]}" run --rm --quiet-pull \
+    metabase "migrate down" 2>&1) || exit_code=$?
+
+  # Always print output for visibility
+  echo "$output"
+
+  # Check for errors - Metabase returns 0 even on partial rollback failures
+  if [[ $exit_code -ne 0 ]]; then
+    error "migrate down failed with exit code $exit_code"
+    return 1
+  fi
+
+  if grep -q "ERROR.*liquibase\|RollbackFailedException\|Command failed with exception" <<<"$output"; then
+    error "migrate down encountered errors (check logs above)"
+    return 1
+  fi
+
+  if grep -q "not rolled back" <<<"$output"; then
+    if changesets_in_grace_period "$output"; then
+      return 2
+    fi
+    error "migrate down had changesets that were not rolled back (check logs above)"
+    return 1
+  fi
+}
+
+fetch_history() {
+  local git_=(git -C "$REPO_ROOT") head
+  [[ "$("${git_[@]}" rev-parse --is-shallow-repository)" == "true" ]] || return 0
+  head=$("${git_[@]}" rev-parse HEAD)
+  "${git_[@]}" fetch -q --no-tags --shallow-since="${GRACE_PERIOD} days ago" origin "$head" &&
+    "${git_[@]}" fetch -q --no-tags --deepen=1 origin "$head"
+}
+
+changesets_in_grace_period() {
+  local ids id id_line commit added now age_hours base json=""
+  ids=$(grep "not in the changelog file:" <<<"$1" | sed 's/.*not in the changelog file://' |
+    grep -oE 'v[0-9]+\.[0-9A-Za-z:._-]+' | sort -u || true)
+  if [[ -z "$ids" ]]; then
+    warn "Could not read the changeset ids that were not rolled back"
+    return 1
+  fi
+
+  if ! fetch_history; then
+    warn "Could not fetch the git history"
+    return 1
+  fi
+
+  base=$(git -C "$REPO_ROOT" rev-list -1 --first-parent --before="${GRACE_PERIOD} days ago" HEAD)
+  if [[ -z "$base" ]]; then
+    warn "Could not find the commit from ${GRACE_PERIOD} day(s) ago"
+    return 1
+  fi
+
+  now=$(date +%s)
+  for id in $ids; do
+    id_line="^[[:space:]]*id:[[:space:]]*['\"]?${id//./\\.}['\"]?[[:space:]]*$"
+    if git -C "$REPO_ROOT" grep -qE "$id_line" "$base" -- resources/migrations; then
+      warn "$id was already in ${base:0:11}, which is older than ${GRACE_PERIOD} day(s)"
+      return 1
+    fi
+    commit="" added=""
+    read -r commit added < <(git -C "$REPO_ROOT" -c log.showRoot=false log --since="${GRACE_PERIOD} days ago" \
+      -E -G "$id_line" --format='%H %ct' HEAD -- resources/migrations | tail -1) || true
+    if [[ -z "${commit:-}" ]]; then
+      warn "$id was not added in the last ${GRACE_PERIOD} day(s)"
+      return 1
+    fi
+    age_hours=$(( (now - added) / 3600 ))
+    warn "$id was added ${age_hours}h ago in ${commit:0:11}, which is in the grace period of ${GRACE_PERIOD} day(s)"
+    json+="${json:+,}{\"id\":\"$id\",\"commit\":\"$commit\",\"age_hours\":$age_hours}"
+  done
+
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    echo "unreleased_migrations=[$json]" >> "$GITHUB_OUTPUT"
+  fi
+}
+
+skip_for_unreleased_changesets() {
+  local message="Skipped $SOURCE_VERSION → $TARGET_VERSION: master has migrations that the released images do not have yet. The test runs in full again after the release."
+  warn "$message"
+  echo "::warning title=Cross-version test skipped::$message"
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    echo "⚠️ $message" >> "$GITHUB_STEP_SUMMARY"
+  fi
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    echo "skipped=true" >> "$GITHUB_OUTPUT"
+  fi
+  exit 0
+}
+
+# Cascading migrate down: rolls back multiple major versions one at a time
+# Metabase only supports rolling back one major version per `migrate down` call,
+# so we need to iterate through intermediate versions.
+cascading_migrate_down() {
+  local source_version="$1"
+  local target_version="$2"
+
+  local source_major target_major edition_prefix
+  source_major=$(cli major "$source_version") || return 1
+  target_major=$(cli major "$target_version") || return 1
+  edition_prefix=$(get_edition_prefix "$source_version") || return 1
+
+  local steps=$((source_major - target_major))
+  local versions=("$source_version")
+  if [[ "$source_version" == "HEAD" ]]; then
+    steps=1
+  else
+    # Build version sequence: source version first, then intermediate rolling versions
+    local current=$((source_major - 1))
+    while (( current > target_major )); do
+      versions+=("v${edition_prefix}.${current}.x")
+      ((current--))
+    done
+  fi
+  log "Cascading migrate down: v$source_major → v$target_major ($steps step(s))"
+
+  # Simple loop - each step handles its own image resolution
+  local step=1
+  for version in "${versions[@]}"; do
+    log "--------------------------------------------"
+    log "Cascade step $step/$steps: $version"
+    log "--------------------------------------------"
+    local step_rc=0
+    migrate_down_step "$version" || step_rc=$?
+    if (( step_rc == 2 )); then
+      return 2
+    elif (( step_rc != 0 )); then
+      error "Migrate down failed at step $step ($version)"
+      return 1
+    fi
+    ((step++))
+  done
+
+  log "--------------------------------------------"
+  log "Cascading migrate down complete"
+}
+
+# Check if Metabase refuses to start (downgrade detection)
+check_downgrade_refused() {
+  local timeout=60
+  local start_time=$(date +%s)
+
+  log "Checking if Metabase detects downgrade and refuses to start..."
+
+  while true; do
+    local current_time=$(date +%s)
+    local elapsed=$((current_time - start_time))
+
+    if (( elapsed >= timeout )); then
+      error "Timed out waiting for downgrade detection"
+      return 1
+    fi
+
+    local status=$(docker compose ps -a metabase --format '{{.Status}}' 2>/dev/null || echo "")
+
+    # Check container logs for downgrade error
+    local logs=$(docker compose logs metabase 2>&1 || true)
+
+    if grep -q "Downgrade detected" <<<"$logs"; then
+      log "Metabase correctly detected downgrade scenario"
+      return 0
+    fi
+
+    if [[ "$status" =~ [Ee]xit ]]; then
+      error "Metabase container exited without a downgrade error"
+      return 1
+    fi
+
+    if [[ "$(curl -sf "http://localhost:${METABASE_PORT}/api/health" 2>/dev/null)" == '{"status":"ok"}' ]]; then
+      error "Metabase started on a newer app DB instead of refusing the downgrade"
+      return 1
+    fi
+
+    sleep 2
+  done
+}
+
+teardown() {
+  docker compose down -v --remove-orphans 2>/dev/null || true
+}
+
+# Ensure each run starts w/ empty log directory
+init_logs() {
+  mkdir -p "$LOG_DIR"
+  rm -f "$LOG_DIR"/docker-*.log
+}
+
+cleanup() {
+  log "Cleaning up..."
+  save_logs metabase "teardown"
+  save_logs postgres "teardown"
+  teardown
+}
+
+xml_escape() {
+  local value="$1"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  value="${value//\"/&quot;}"
+  printf '%s' "$value"
+}
+
+write_junit_result() {
+  local code="$1"
+  local name="$2"
+  local result="/>"
+  if (( code != 0 )); then
+    result="><failure message=\"test.sh exited with code ${code}\">test.sh exited with code ${code}</failure></testcase>"
+  fi
+  mkdir -p "$(dirname "$CROSS_VERSION_JUNIT_FILE")"
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="cross-version">\n  <testcase name="%s" classname="cross-version" file="cross-version/test.sh"%s\n</testsuite>\n' \
+    "$(xml_escape "$name")" "$result" > "$CROSS_VERSION_JUNIT_FILE"
+}
+
+# Writes a small xml file recording pass/fail that is uploaded to CI Conductor so we can quarantine these tests if required.
+record_result() {
+  local code="$1"
+  local name="$SOURCE_VERSION -> $TARGET_VERSION"
+  if (( CYPRESS_FAILURES_RECORDED == 1 )); then
+    code=0
+  fi
+  if [[ -n "${CROSS_VERSION_JUNIT_FILE:-}" ]]; then
+    write_junit_result "$code" "$name"
+  fi
+  (( code == 0 )) && return 0
+  [[ -n "${QUARANTINE_FAILURES_FILE:-}" ]] || return 0
+  mkdir -p "$(dirname "$QUARANTINE_FAILURES_FILE")"
+  printf '{"test_name":"%s","test_path":"cross-version","file_path":"cross-version/test.sh"}\n' \
+    "$name" >> "$QUARANTINE_FAILURES_FILE"
+}
+
+check_image_exists() {
+  local image="$1"
+  if ! docker manifest inspect "$image" > /dev/null 2>&1; then
+    error "Docker image not found: $image"
+    exit 1
+  fi
+}
+
+main() {
+  local direction source_image target_image
+
+  trap 'code=$?; record_result "$code"; exit "$code"' EXIT
+
+  direction=$(cli compare "$SOURCE_VERSION" "$TARGET_VERSION") || exit 1
+  source_image=$(cli image "$SOURCE_VERSION") || exit 1
+  target_image=$(cli image "$TARGET_VERSION") || exit 1
+
+  if [[ "$direction" == "same" ]]; then
+    error "Source and target versions are the same"
+    exit 1
+  fi
+
+  log "Checking if Docker images exist..."
+  check_image_exists "$source_image"
+  check_image_exists "$target_image"
+
+  if [[ "$SOURCE_VERSION" == "HEAD" ]]; then
+    HEAD_IMAGE="$source_image"
+  elif [[ "$TARGET_VERSION" == "HEAD" ]]; then
+    HEAD_IMAGE="$target_image"
+  fi
+  [[ -n "$HEAD_IMAGE" ]] && patch_head_jar "$HEAD_IMAGE"
+
+  log "============================================"
+  log "Cross-Version Migration Test"
+  log "============================================"
+  log "Direction: $direction"
+  log "Source: $source_image"
+  log "Target: $target_image"
+  log "============================================"
+
+  # Ensure clean state
+  teardown
+  init_logs
+
+  trap 'code=$?; cleanup; record_result "$code"; exit "$code"' EXIT
+
+  if [[ "$direction" == "downgrade" ]]; then
+    log ""
+    log "Step 0: Seeding app DB with TARGET version ($TARGET_VERSION)..."
+    start_metabase "$target_image"
+
+    if ! wait_for_health "$HEALTH_TIMEOUT"; then
+      error "❌ TARGET version ($TARGET_VERSION) failed health check on an empty app DB"
+      docker compose logs metabase
+      exit 1
+    fi
+
+    stop_metabase "seed target $TARGET_VERSION"
+  fi
+
+  log ""
+  log "Step 1: Starting SOURCE version ($SOURCE_VERSION)..."
+  start_metabase "$source_image"
+
+  if ! wait_for_health "$HEALTH_TIMEOUT"; then
+    error "❌ SOURCE version ($SOURCE_VERSION) failed health check"
+    docker compose logs metabase
+    exit 1
+  fi
+
+  log "✅ SOURCE version ($SOURCE_VERSION) is healthy"
+
+  log ""
+  log "Step 2: Running e2e tests (@source)..."
+  if ! run_e2e source "$SOURCE_VERSION"; then
+    exit 1
+  fi
+
+  log ""
+  log "Step 3: Stopping SOURCE version ($SOURCE_VERSION)..."
+  stop_metabase "source $SOURCE_VERSION"
+
+  log ""
+  log "Step 4: Starting TARGET version ($TARGET_VERSION)..."
+  start_metabase "$target_image"
+
+  if [[ "$direction" == "upgrade" ]]; then
+    # Upgrade: should migrate automatically and become healthy
+    if ! wait_for_health "$HEALTH_TIMEOUT"; then
+      error "❌ TARGET version ($TARGET_VERSION) failed health check after upgrade"
+      docker compose logs metabase
+      exit 1
+    fi
+    log "✅ UPGRADE successful - TARGET version ($TARGET_VERSION) is healthy"
+
+    log ""
+    log "Step 5: Running e2e tests (@target)..."
+    if ! run_e2e target "$TARGET_VERSION"; then
+      exit 1
+    fi
+
+  else
+    # Downgrade: should refuse to start, then we run migrate down
+    if ! check_downgrade_refused; then
+      error "❌ TARGET version ($TARGET_VERSION) did not properly detect downgrade"
+      docker compose logs metabase
+      exit 1
+    fi
+
+    # Stop the failed container
+    stop_metabase "target $TARGET_VERSION (downgrade refused)"
+
+    log ""
+    log "Step 5: Rolling back database ($SOURCE_VERSION → $TARGET_VERSION)..."
+    local cascade_rc=0
+    cascading_migrate_down "$SOURCE_VERSION" "$TARGET_VERSION" || cascade_rc=$?
+    if (( cascade_rc == 2 )); then
+      skip_for_unreleased_changesets
+    elif (( cascade_rc != 0 )); then
+      error "❌ migrate down failed"
+      exit 1
+    fi
+
+    # Try starting again
+    log ""
+    log "Step 6: Starting TARGET version ($TARGET_VERSION) after migrate down..."
+    start_metabase "$target_image"
+
+    if ! wait_for_health "$HEALTH_TIMEOUT"; then
+      error "❌ TARGET version ($TARGET_VERSION) failed health check after migrate down"
+      docker compose logs metabase
+      exit 1
+    fi
+    log "✅ DOWNGRADE successful - TARGET version ($TARGET_VERSION) is healthy after migrate down"
+
+    log ""
+    log "Step 7: Running e2e tests (@target)..."
+    if ! run_e2e target "$TARGET_VERSION"; then
+      exit 1
+    fi
+  fi
+
+  log ""
+  log "============================================"
+  log "✅ TEST PASSED"
+  log "============================================"
+}
+
+main

@@ -1,0 +1,62 @@
+import type { ComponentType } from "react";
+
+import { PluginPlaceholder } from "metabase/plugins/components/PluginPlaceholder";
+import type {
+  Database,
+  DatabaseData,
+  DatabaseId,
+  DatabaseLocalSettingAvailability,
+  TableId,
+} from "metabase-types/api";
+
+import { definePluginSlot } from "../slot";
+
+const getDefaultPluginDbRouting = () => ({
+  // Unjustified type cast. FIXME
+  DatabaseRoutingSection: PluginPlaceholder as ComponentType<{
+    database: Database;
+  }>,
+  getDatabaseNameFieldProps: (_isSlug: boolean) => ({}),
+  getDestinationDatabaseRoutes: (_IsAdmin: any) =>
+    // Unjustified type cast. FIXME
+    null as React.ReactElement | null,
+  useRedirectDestinationDatabase: (
+    _database: Pick<Database, "id" | "router_database_id"> | undefined,
+  ): void => {},
+  getPrimaryDBEngineFieldState: (
+    _database: Pick<Database, "router_user_attribute">,
+  ): "default" | "hidden" | "disabled" => "default",
+});
+
+export const PLUGIN_DB_ROUTING = definePluginSlot(getDefaultPluginDbRouting);
+
+const getDefaultPluginDatabaseReplication = () => ({
+  // Unjustified type cast. FIXME
+  DatabaseReplicationSection: PluginPlaceholder as ComponentType<{
+    database: Database;
+  }>,
+});
+
+export const PLUGIN_DATABASE_REPLICATION = definePluginSlot(
+  getDefaultPluginDatabaseReplication,
+);
+
+const getDefaultPluginTableEditing = () => ({
+  isEnabled: () => false,
+  isDatabaseTableEditingEnabled: (_database: Database): boolean => false,
+  // Unjustified type cast. FIXME
+  getRoutes: () => null as React.ReactElement | null,
+  getTableEditUrl: (_tableId: TableId, _databaseId: DatabaseId): string => "/",
+  // Unjustified type cast. FIXME
+  AdminDatabaseTableEditingSection: PluginPlaceholder as ComponentType<{
+    database: Database;
+    settingsAvailable?: Record<string, DatabaseLocalSettingAvailability>;
+    updateDatabase: (
+      database: { id: DatabaseId } & Partial<DatabaseData>,
+    ) => Promise<void>;
+  }>,
+});
+
+export const PLUGIN_TABLE_EDITING = definePluginSlot(
+  getDefaultPluginTableEditing,
+);

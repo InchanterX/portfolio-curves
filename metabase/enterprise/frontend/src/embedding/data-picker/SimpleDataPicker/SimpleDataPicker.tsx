@@ -1,0 +1,193 @@
+/* eslint-disable @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment -- FIXME: any-typed values */
+import { useDisclosure } from "@mantine/hooks";
+import { useMemo } from "react";
+
+import { skipToken, useSearchQuery } from "metabase/api";
+import { DelayedLoadingAndErrorWrapper } from "metabase/common/components/LoadingAndErrorWrapper/DelayedLoadingAndErrorWrapper";
+import type { DataSource } from "metabase/embedding-sdk/types/components/data-picker";
+import { PLUGIN_LIBRARY, type SimpleDataPickerProps } from "metabase/plugins";
+import type { EmbeddingEntityType } from "metabase/redux/store/embedding-data-picker";
+import { useSetting } from "metabase/settings";
+import { Box, Popover } from "metabase/ui";
+import type { SearchModel, SearchResult } from "metabase-types/api";
+import type { SortingOptions } from "metabase-types/api/sorting";
+
+import { SimpleDataPickerView } from "./SimpleDataPickerView";
+
+export function SimpleDataPicker({
+  filterByDatabaseId,
+  isJoinStep,
+  selectedSource,
+  isInitiallyOpen,
+  setSourceFn,
+  triggerElement,
+  entityTypes,
+}: SimpleDataPickerProps) {
+  const [isDataPickerOpened, { toggle, close }] =
+    useDisclosure(isInitiallyOpen);
+  const searchModels = translateEntityTypesToSearchModels(entityTypes);
+  const { data, isLoading, error } = useSearchQuery(
+    searchModels.length > 0
+      ? {
+          table_db_id: filterByDatabaseId ? filterByDatabaseId : undefined,
+          models: searchModels,
+          context: "data-picker",
+        }
+      : skipToken,
+  );
+  const {
+    data: libraryData,
+    isLoading: isLibraryLoading,
+    error: libraryError,
+  } = useLibrarySearch({
+    entityTypes,
+    searchModels,
+    filterByDatabaseId,
+    isJoinStep,
+  });
+
+  const options = useMemo(() => {
+    const entities = [...(data?.data ?? []), ...(libraryData?.data ?? [])];
+
+    return sortEntities(entities, {
+      sort_column: "name",
+      sort_direction: "asc",
+    }).flatMap((entity) => {
+      const source = getEntitySource(entity);
+      return source != null
+        ? [{ name: entity.name, source, model: entity.model }]
+        : [];
+    });
+  }, [data, libraryData]);
+
+  return (
+    <Popover
+      opened={isDataPickerOpened}
+      position="bottom-start"
+      onChange={(isOpen) => {
+        if (!isOpen) {
+          close();
+        }
+      }}
+      trapFocus
+    >
+      <Popover.Target>
+        <Box
+          onClick={toggle}
+          data-testid="embedding-simple-data-picker-trigger"
+        >
+          {triggerElement}
+        </Box>
+      </Popover.Target>
+      <Popover.Dropdown>
+        <DelayedLoadingAndErrorWrapper
+          loading={isLoading || isLibraryLoading}
+          error={error ?? libraryError}
+        >
+          <SimpleDataPickerView
+            selectedSource={selectedSource}
+            onClick={(source) => {
+              close();
+              setSourceFn(source);
+            }}
+            options={options}
+          />
+        </DelayedLoadingAndErrorWrapper>
+      </Popover.Dropdown>
+    </Popover>
+  );
+}
+
+/**
+ * Searches the tables and metrics published in the Library when `entityTypes`
+ * includes `semantic-layer`, skipping those `searchModels` already finds everywhere.
+ * Returns no data without a Library the user can read.
+ */
+function useLibrarySearch({
+  entityTypes,
+  searchModels,
+  filterByDatabaseId,
+  isJoinStep,
+}: Pick<
+  SimpleDataPickerProps,
+  "entityTypes" | "filterByDatabaseId" | "isJoinStep"
+> & { searchModels: SearchModel[] }) {
+  const hasNestedQueriesEnabled = useSetting("enable-nested-queries");
+  const canSelectMetric = !isJoinStep && hasNestedQueriesEnabled;
+  const publishedModels: SearchModel[] = canSelectMetric
+    ? ["table", "metric"]
+    : ["table"];
+  // The general search already finds published tables and metrics when
+  // `searchModels` asks for them, so only ask the Library for the rest
+  const libraryModels = publishedModels.filter(
+    (model) => !searchModels.includes(model),
+  );
+  const { data: libraryCollection, isLoading: isLibraryCollectionLoading } =
+    PLUGIN_LIBRARY.useGetLibraryCollection({
+      skip:
+        !entityTypes.includes("semantic-layer") || libraryModels.length === 0,
+    });
+  const { data, isLoading, error } = useSearchQuery(
+    libraryCollection && libraryModels.length > 0
+      ? {
+          table_db_id: filterByDatabaseId ? filterByDatabaseId : undefined,
+          models: libraryModels,
+          collection: libraryCollection.id,
+          context: "data-picker",
+        }
+      : skipToken,
+  );
+
+  return { data, isLoading: isLibraryCollectionLoading || isLoading, error };
+}
+
+type SortColumn = keyof SearchResult;
+
+function getEntitySource(entity: SearchResult): DataSource | undefined {
+  const { id, model } = entity;
+  if (typeof id !== "number") {
+    return undefined;
+  }
+  return model === "dataset" || model === "metric"
+    ? { type: "card", id }
+    : { type: "table", id };
+}
+
+function sortEntities(
+  entities: SearchResult[],
+  sort: SortingOptions<SortColumn>,
+) {
+  const { sort_column, sort_direction } = sort;
+
+  return [...entities].sort((entityA, entityB) => {
+    const aValue = entityA[sort_column] ?? "";
+    const bValue = entityB[sort_column] ?? "";
+
+    const result = compareString(aValue, bValue);
+
+    // No need to check for 0 since -0 and 0 are equal
+    return sort_direction === "asc" ? result : -result;
+  });
+}
+
+const compareString = (a: string, b: string) => a.localeCompare(b);
+
+function translateEntityTypesToSearchModels(
+  entityTypes: EmbeddingEntityType[],
+): SearchModel[] {
+  const searchModels: SearchModel[] = [];
+
+  if (entityTypes.includes("model")) {
+    searchModels.push("dataset");
+  }
+
+  if (entityTypes.includes("table")) {
+    searchModels.push("table");
+  }
+
+  if (entityTypes.includes("metric")) {
+    searchModels.push("metric");
+  }
+
+  return searchModels;
+}

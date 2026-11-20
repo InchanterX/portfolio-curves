@@ -1,0 +1,31 @@
+.input {
+  background-color: var(--mb-color-background_surface-primary);
+  background-image: linear-gradient(
+    var(--mb-color-input-background),
+    var(--mb-color-input-background)
+  );
+
+  &:focus-within {
+    background-image: none;
+  }
+}
+
+.label {
+  flex: 1 1 0;
+  min-width: 0;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fieldCount {
+  flex-shrink: 0;
+  color: var(--mb-color-text-secondary);
+  font-size: var(--mantine-font-size-xs);
+
+  [data-combobox-option]:hover &,
+  [data-combobox-selected] & {
+    color: var(--mb-color-text-secondary-inverse);
+  }
+}

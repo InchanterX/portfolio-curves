@@ -1,0 +1,236 @@
+import type { Store } from "@reduxjs/toolkit";
+import type { Meta, StoryFn } from "@storybook/react";
+import { userEvent, within } from "@storybook/test";
+import { type ComponentProps, type ComponentType, useEffect } from "react";
+
+import { getPublicStore } from "__support__/entities-store";
+import { mockSettings } from "__support__/settings";
+import { createMockState } from "__support__/state";
+import { createMockEntitiesState } from "__support__/store";
+import { MetabaseReduxProvider } from "metabase/redux";
+import type { State } from "metabase/redux/store";
+import { Box, Popover } from "metabase/ui";
+
+import { DatePicker } from "./DatePicker";
+import "metabase/embedding/theme.module.css";
+
+const storeInitialState = createMockState({
+  settings: mockSettings(),
+  entities: createMockEntitiesState({}),
+});
+// Unjustified type cast. FIXME
+const store = getPublicStore(storeInitialState, []) as unknown as Store<State>;
+
+const ReduxDecorator = (Story: ComponentType) => {
+  return (
+    <MetabaseReduxProvider store={store}>
+      <Story />
+    </MetabaseReduxProvider>
+  );
+};
+
+// Unjustified type cast. FIXME
+export default {
+  title: "Components/Parameters/DatePicker",
+  component: DatePicker,
+  decorators: [ReduxDecorator],
+} as Meta<typeof DatePicker>;
+
+const MOCKED_NOW = new Date("2025-01-01T00:00:00.000Z").getTime();
+const OriginalDate = Date;
+
+const MockedDate: DateConstructor = new Proxy(OriginalDate, {
+  construct: (target, args: unknown[]) =>
+    Reflect.construct(target, args.length ? args : [MOCKED_NOW]),
+  get: (target, property, receiver) =>
+    property === "now"
+      ? () => MOCKED_NOW
+      : Reflect.get(target, property, receiver),
+});
+
+function WithMockDate(StoryFn: ComponentType) {
+  window.Date = MockedDate;
+
+  useEffect(() => {
+    return () => {
+      window.Date = OriginalDate;
+    };
+  }, []);
+
+  return <StoryFn />;
+}
+
+type CustomStoryProps = {
+  snapshotSize?: {
+    width: number;
+    height: number;
+  };
+};
+const Template: StoryFn<
+  ComponentProps<typeof DatePicker> & CustomStoryProps
+> = (args) => {
+  return (
+    <>
+      <Popover opened position="bottom-start" withinPortal={false}>
+        <Popover.Target>
+          <div></div>
+        </Popover.Target>
+        <Popover.Dropdown>
+          <DatePicker {...args} />
+        </Popover.Dropdown>
+      </Popover>
+      {args.snapshotSize && (
+        <Box
+          pos="absolute"
+          // the space between the popover and the target element
+          mt="8px"
+          w={args.snapshotSize.width}
+          h={args.snapshotSize.height}
+        />
+      )}
+    </>
+  );
+};
+
+export const AllOptions = {
+  render: Template,
+  play: async ({ canvasElement }: { canvasElement: HTMLCanvasElement }) => {
+    const canvas = within(canvasElement);
+    const yesterday = canvas.getByRole("button", {
+      name: "Yesterday",
+    });
+    yesterday.classList.add("pseudo-hover");
+  },
+};
+export const AllOptionsDarkTheme = {
+  ...AllOptions,
+  args: { theme: "dark" },
+};
+
+export const Exclude = {
+  render: Template,
+  play: async ({ canvasElement }: { canvasElement: HTMLCanvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(
+      canvas.getByRole("button", {
+        name: "Exclude…",
+      }),
+    );
+    canvas
+      .getByRole("button", { name: "Days of the week…" })
+      .classList.add("pseudo-hover");
+  },
+};
+export const ExcludeDarkTheme = {
+  ...Exclude,
+  args: { theme: "dark" },
+};
+
+export const ExcludeDayOfWeek = {
+  render: Template,
+  args: {
+    value: {
+      type: "exclude",
+      operator: "!=",
+      unit: "day-of-week",
+      values: [3, 4, 5],
+    },
+  },
+};
+export const ExcludeDayOfWeekDarkTheme = {
+  ...ExcludeDayOfWeek,
+  args: { ...ExcludeDayOfWeek.args, theme: "dark" },
+};
+
+export const RelativeCurrent = {
+  render: Template,
+  args: {
+    value: { type: "relative", unit: "day", value: 0 },
+  },
+  play: async ({ canvasElement }: { canvasElement: HTMLCanvasElement }) => {
+    const canvas = within(canvasElement);
+    // Chip's hover styles live on its label, not the hidden radio input
+    const week = canvas.getByText("Week").closest("label");
+    week?.classList.add("pseudo-hover");
+    const next = canvas.getByRole("tab", {
+      name: "Next",
+    });
+    next.classList.add("pseudo-hover");
+  },
+};
+export const RelativeCurrentDarkTheme = {
+  ...RelativeCurrent,
+  args: { ...RelativeCurrent.args, theme: "dark" },
+};
+
+export const RelativePrevious = {
+  render: Template,
+  args: {
+    value: {
+      options: { includeCurrent: true },
+      type: "relative",
+      unit: "month",
+      value: -12,
+    },
+  },
+  play: async ({ canvasElement }: { canvasElement: HTMLCanvasElement }) => {
+    const canvas = within(canvasElement);
+    const next = canvas.getByRole("tab", {
+      name: "Next",
+    });
+    next.classList.add("pseudo-hover");
+  },
+  decorators: [WithMockDate],
+};
+export const RelativePreviousDarkTheme = {
+  ...RelativePrevious,
+  args: { ...RelativePrevious.args, theme: "dark" },
+};
+
+export const RelativeNext = {
+  render: Template,
+  args: {
+    value: { type: "relative", unit: "day", value: 30 },
+    snapshotSize: {
+      width: 365,
+      height: 415,
+    },
+  },
+  play: async ({ canvasElement }: { canvasElement: HTMLCanvasElement }) => {
+    const canvas = within(canvasElement);
+    const next = canvas.getByRole("tab", {
+      name: "Next",
+    });
+    next.classList.add("pseudo-hover");
+    await userEvent.click(canvas.getByRole("textbox", { name: "Unit" }));
+  },
+  decorators: [WithMockDate],
+};
+export const RelativeNextDarkTheme = {
+  ...RelativeNext,
+  args: { ...RelativeNext.args, theme: "dark" },
+};
+
+export const SpecificBetween = {
+  render: Template,
+  args: {
+    value: {
+      type: "specific",
+      operator: "between",
+      values: [
+        new Date("2024-11-11T17:00:00.000Z"),
+        new Date("2024-11-20T17:00:00.000Z"),
+      ],
+      hasTime: false,
+    },
+  },
+  play: async ({ canvasElement }: { canvasElement: HTMLCanvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(canvas.getByRole("button", { name: "Add time" }));
+  },
+};
+
+export const SpecificBetweenDarkTheme = {
+  ...SpecificBetween,
+  args: { ...SpecificBetween.args, theme: "dark" },
+};

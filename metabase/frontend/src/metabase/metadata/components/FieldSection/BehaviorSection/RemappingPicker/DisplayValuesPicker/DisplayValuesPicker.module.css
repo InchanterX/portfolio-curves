@@ -1,0 +1,8 @@
+.infoIconContainer {
+  pointer-events: none;
+}
+
+.infoIcon {
+  display: block;
+  pointer-events: all;
+}

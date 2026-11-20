@@ -1,0 +1,222 @@
+(ns metabase-enterprise.audit-app.permissions-test
+  (:require
+   [clojure.set :as set]
+   [clojure.string :as str]
+   [clojure.test :refer :all]
+   [metabase-enterprise.audit-app.audit-test :as audit-test]
+   [metabase-enterprise.audit-app.permissions :as audit-app.permissions]
+   [metabase.audit-app.core :as audit]
+   [metabase.core.core :as mbc]
+   [metabase.lib-be.metadata.jvm :as lib.metadata.jvm]
+   [metabase.lib.core :as lib]
+   [metabase.lib.metadata :as lib.metadata]
+   [metabase.models.interface :as mi]
+   [metabase.permissions.data-permissions :as data-perms]
+   [metabase.permissions.models.collection.graph :refer [update-graph!]]
+   [metabase.permissions.models.collection.graph-test :refer [graph]]
+   [metabase.query-processor.error-type :as qp.error-type]
+   [metabase.query-processor.test :as qp]
+   [metabase.sync.core :as sync]
+   [metabase.test :as mt]
+   [metabase.test.fixtures :as fixtures]
+   [metabase.test.util :as tu]
+   [metabase.util :as u]
+   [toucan2.core :as t2]))
+
+(use-fixtures :once (fixtures/initialize :db :plugins))
+
+(deftest audit-db-view-names-test
+  (testing "`audit-db-view-names` includes all views in the app DB prefixed with `v_`"
+    (let [view-query "SELECT table_name FROM information_schema.views WHERE table_name LIKE 'v\\_%';"]
+      (is (set/superset?
+           audit-app.permissions/audit-db-view-names
+           (into #{}
+                 (map :table_name (t2/query view-query))))))))
+
+(deftest audit-db-basic-query-test
+  (audit-test/with-audit-db-restoration!
+    (mt/with-premium-features #{:audit-app}
+      (is (= "complete" (t2/select-one-fn :initial_sync_status :model/Database :id audit/audit-db-id))
+          "The sync status should be completed by this point. (In test it is synchronous!)")
+      (mt/with-test-user :crowberto
+        (testing "A query using a saved audit model as the source table runs successfully"
+          (let [audit-card (t2/select-one :model/Card :database_id audit/audit-db-id :type :model)]
+            (is (partial=
+                 {:status :completed}
+                 (qp/process-query
+                  {:database audit/audit-db-id
+                   :type     :query
+                   :query    {:source-table (str "card__" (u/the-id audit-card))}})))))
+        (testing "A non-native query can be run on views in the audit DB"
+          (let [audit-view (t2/select-one :model/Table
+                                          :db_id audit/audit-db-id
+                                          {:where [:in [:lower :name] audit-app.permissions/audit-db-view-names]})]
+            (when-not (some-> audit-view :name u/lower-case-en (str/starts-with? "v_"))
+              (sync/sync-database! (:id (t2/select-one :model/Database :id audit/audit-db-id))))
+            (is (partial=
+                 {:status :completed}
+                 (qp/process-query
+                  {:database audit/audit-db-id
+                   :type     :query
+                   :query    {:source-table (u/the-id audit-view)}})))))))))
+
+(defn- refusal
+  "Run `query` and return the message and the QP error type of the exception that refuses it, or nil when it runs."
+  [query]
+  (try
+    (qp/process-query query)
+    nil
+    (catch clojure.lang.ExceptionInfo e
+      {:message (ex-message e), :type (:type (ex-data e))})))
+
+(deftest audit-db-disallowed-queries-test
+  (audit-test/with-audit-db-restoration!
+    (mt/with-premium-features #{:audit-app}
+      (mt/with-test-user :crowberto
+        (testing "Native queries are not allowed to be run on audit DB views, even by admins"
+          (is (= {:message "Native queries are not allowed on the audit database"
+                  :type    qp.error-type/invalid-query}
+                 (refusal {:database audit/audit-db-id
+                           :type     :native
+                           :native   {:query "SELECT * FROM v_audit_log;"}}))))
+        (testing "Non-native queries are not allowed to run on tables in the audit DB that are not views"
+          ;; Nothing should be synced directly from the audit DB, just loaded via serialization, so only the views
+          ;; should have metadata present in the app DB in the first place. But in case this changes, we want to
+          ;; explicitly block other tables from being queried.
+          (mt/with-temp [:model/Table table {:db_id audit/audit-db-id}
+                         :model/Field _     {:table_id (u/the-id table)}]
+            (is (= {:message "Audit queries are only allowed on audit views"
+                    :type    qp.error-type/invalid-query}
+                   (refusal {:database audit/audit-db-id
+                             :type     :query
+                             :query    {:source-table (u/the-id table)}})))))
+        (testing "Users without access to the audit collection cannot run any queries on the audit DB, even if they
+                   have data perms for the audit DB"
+          (mt/with-full-data-perms-for-all-users!
+            (mt/with-test-user :rasta
+              (mt/with-non-admin-groups-no-collection-perms (audit/default-audit-collection)
+                (let [audit-view (->> (t2/select-one :model/Table :db_id audit/audit-db-id {:where [:like [:lower :name] "v_%"]})
+                                      (tu/poll-until 5000))]
+                  (is (= {:message "You do not have access to the audit database"
+                          :type    qp.error-type/missing-required-permissions}
+                         (refusal {:database audit/audit-db-id
+                                   :type     :query
+                                   :query    {:source-table (u/the-id audit-view)}}))))))))))))
+
+(deftest audit-db-query-without-audit-app-feature-test
+  (audit-test/with-audit-db-restoration!
+    (mt/with-premium-features #{}
+      (mt/with-test-user :crowberto
+        (testing "Without the audit-app feature, the OSS check refuses every query on the audit DB"
+          (is (= {:message "Querying this database requires the audit-app feature flag"
+                  :type    qp.error-type/disabled-feature}
+                 (refusal {:database audit/audit-db-id
+                           :type     :native
+                           :native   {:query "SELECT 1;"}}))))))))
+
+(deftest analytics-permissions-test
+  (mt/with-premium-features #{:audit-app}
+    (mt/with-temp [:model/PermissionsGroup {group-id :id}    {}
+                   :model/Database         {database-id :id} {:is_audit true}
+                   :model/Table            view-table        {:db_id database-id :name "v_users"}
+                   :model/Collection       collection        {:namespace "analytics"}]
+      (with-redefs [audit/audit-db-id                 database-id
+                    audit/default-audit-collection (constantly collection)]
+        (testing "Updating permissions for the audit collection also updates audit DB permissions"
+          ;; Audit DB starts with full data access but no query builder access
+          (is (= :unrestricted (get (data-perms/table-permissions-for-groups #{group-id} :perms/view-data {(:id view-table) database-id}) (:id view-table))))
+          (is (= :no (get (data-perms/table-permissions-for-groups #{group-id} :perms/create-queries {(:id view-table) database-id}) (:id view-table))))
+          ;; Granting access to the audit collection also grants query builder access to the DB
+          (update-graph! (assoc-in (graph :clear-revisions? true) [:groups group-id (:id collection)] :read))
+          (is (= :unrestricted (get (data-perms/table-permissions-for-groups #{group-id} :perms/view-data {(:id view-table) database-id}) (:id view-table))))
+          (is (= :query-builder (get (data-perms/table-permissions-for-groups #{group-id} :perms/create-queries {(:id view-table) database-id}) (:id view-table)))))
+        (testing "Setting audit collection to :write downgrades to :read instead of throwing (#71300)"
+          (update-graph! (assoc-in (graph :clear-revisions? true :collections [collection] :groups [group-id])
+                                   [:groups group-id (:id collection)] :write))
+          (is (= :read (get-in (graph :clear-revisions? true :collections [collection] :groups [group-id])
+                               [:groups group-id (:id collection)]))
+              "Audit collection permission should be stored as :read, not :write")
+          (is (= :unrestricted (get (data-perms/table-permissions-for-groups #{group-id} :perms/view-data {(:id view-table) database-id}) (:id view-table))))
+          (is (= :query-builder (get (data-perms/table-permissions-for-groups #{group-id} :perms/create-queries {(:id view-table) database-id}) (:id view-table)))))))))
+
+;; TODO: re-enable these tests once they're no longer flaky
+(defn install-audit-db-if-needed!
+  "Checks if there's an audit-db. if not, it will create it and serialize audit content, including the
+  `default-audit-collection`. If the audit-db is there, this does nothing."
+  []
+  (let [coll (boolean (audit/default-audit-collection))
+        default-audit-id (:id (audit/default-audit-collection))
+        cards (t2/exists? :model/Card :collection_id default-audit-id)
+        dashboards (t2/exists? :model/Dashboard :collection_id default-audit-id)]
+    (when-not (and coll cards dashboards)
+      ;; Force audit db to load, even if the checksum has not changed. Sometimes analytics bits get removed by tests,
+      ;; but next time we go to load analytics data, we find the existing checksum and don't bother loading it again.
+      (mt/with-temporary-setting-values [last-analytics-checksum -1]
+        (mbc/ensure-audit-db-installed!)))))
+
+(deftest can-write-false-for-audit-card-content-test
+  (install-audit-db-if-needed!)
+  (mt/with-temp [:model/Card audit-child-card {:collection_id (:id (audit/default-audit-collection))}
+                 :model/Card root-child-card {:collection_id nil}]
+    (is (false? (mi/can-write? (t2/hydrate audit-child-card :can_write))))
+    (mt/with-test-user :rasta
+      (is (true? (mi/can-write? (t2/hydrate root-child-card :can_write)))))
+    (mt/with-test-user :crowberto
+      (is (true? (mi/can-write? (t2/hydrate root-child-card :can_write)))))))
+
+(deftest can-write-is-false-for-audit-content-cards-test
+  (install-audit-db-if-needed!)
+  (let [audit-cards (t2/select :model/Card :collection_id (:id (audit/default-audit-collection)))]
+    (is (= #{false} (set (map mi/can-write? (t2/hydrate audit-cards :can_write)))))))
+
+(deftest cannot-edit-audit-content-cards-over-api
+  (install-audit-db-if-needed!)
+  (let [card (t2/select-one :model/Card :collection_id (:id (audit/default-audit-collection)))]
+    (is (= "You don't have permissions to do that."
+           (mt/user-http-request :rasta :put 403 (str "card/" (u/the-id card)) {:name "My new title"})))))
+
+(deftest can-write-false-for-audit-dashboard-content-test
+  (install-audit-db-if-needed!)
+  (mt/with-temp [:model/Dashboard audit-child-dashboard {:collection_id (:id (audit/default-audit-collection))}
+                 :model/Dashboard root-child-dashboard {:collection_id nil}]
+    (is (false? (mi/can-write? (t2/hydrate audit-child-dashboard :can_write))))
+    (mt/with-test-user :rasta
+      (is (true? (mi/can-write? (t2/hydrate root-child-dashboard :can_write)))))
+    (mt/with-test-user :crowberto
+      (is (true? (mi/can-write? (t2/hydrate root-child-dashboard :can_write)))))))
+
+(deftest can-write-is-false-for-audit-content-dashboards-test
+  (install-audit-db-if-needed!)
+  (let [audit-dashboards (t2/select :model/Dashboard :collection_id (:id (audit/default-audit-collection)))]
+    (is (= #{false} (set (map mi/can-write? (t2/hydrate audit-dashboards :can_write)))))))
+
+(deftest cannot-edit-audit-content-dashboards-over-api
+  (install-audit-db-if-needed!)
+  (let [dashboard (t2/select-one :model/Dashboard :collection_id (:id (audit/default-audit-collection)))]
+    (is (= "You don't have permissions to do that."
+           (mt/user-http-request :rasta :put 403 (str "dashboard/" (u/the-id dashboard)) {:name "My new title"})))))
+
+(deftest audit-db-adhoc-query-and-collection-write-perms-test
+  (audit-test/with-audit-db-restoration!
+    (mt/with-premium-features #{:audit-app}
+      (testing "An ad-hoc aggregation query on top of a saved audit model runs successfully (#43088)"
+        (mt/with-test-user :crowberto
+          (let [audit-card (t2/select-one :model/Card :database_id audit/audit-db-id :type :model :name "People")]
+            (is (some? audit-card)
+                "Expected the audit DB's 'People' model card to exist after installation")
+            (let [mp    (lib.metadata.jvm/application-database-metadata-provider audit/audit-db-id)
+                  query (-> (lib/query mp (lib.metadata/card mp (u/the-id audit-card)))
+                            (lib/aggregate (lib/count)))]
+              (is (partial= {:status :completed}
+                            (qp/process-query query)))))))
+      (testing "the analytics collection is read-only via the API"
+        (let [audit-coll-id (:id (audit/default-audit-collection))
+              items         (:data (mt/user-http-request :crowberto :get 200 "collection/root/items"))
+              analytics     (first (filter #(and (= (:model %) "collection") (= (:id %) audit-coll-id)) items))]
+          (is (some? analytics)
+              "the analytics collection is listed under the root collection")
+          (is (false? (:can_write analytics)))))
+      (testing "GET /api/permissions/graph does not include the audit DB"
+        (let [resp (mt/user-http-request :crowberto :get 200 "permissions/graph")]
+          (is (every? #(not (contains? % audit/audit-db-id))
+                      (vals (:groups resp)))))))))

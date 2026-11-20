@@ -1,0 +1,46 @@
+import type { CSSProperties, ReactNode, RefObject } from "react";
+
+import type { ColorName } from "metabase/ui/colors/types";
+import type { DashCardId, DashboardTabId, IconName } from "metabase-types/api";
+
+export type UndoVariant = "neutral" | "negative" | "warning";
+
+export interface Undo {
+  id: string | number;
+  type?: string;
+  action?: (() => void) | null;
+  message?: ReactNode | ((undo: Undo) => ReactNode);
+  timeout?: number | null;
+  initialTimeout?: number | null;
+  actions?: (() => void)[];
+  showProgress?: boolean;
+  icon?: IconName | null;
+  variant?: UndoVariant;
+  toastColor?: ColorName;
+  dark?: boolean;
+  iconColor?: ColorName;
+  style?: CSSProperties;
+  actionLabel?: string;
+  canDismiss?: boolean;
+  startedAt?: number;
+  pausedAt?: number | null;
+  dismissIconColor?: ColorName;
+  extraInfo?: { dashcardIds?: DashCardId[]; tabId?: DashboardTabId } & Record<
+    string,
+    unknown
+  >;
+  _domId?: string | number;
+  timeoutId: number | null;
+  count?: number;
+  verb?: string;
+  subject?: string;
+  extraAction?: {
+    label: string;
+    action: () => void;
+  };
+  ref?: RefObject<HTMLDivElement | null>;
+  renderChildren?: (undo: Undo) => ReactNode;
+  onDismiss?: (undoId: string | number) => void;
+}
+
+export type UndoState = Undo[];

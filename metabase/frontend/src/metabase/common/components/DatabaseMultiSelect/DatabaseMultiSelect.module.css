@@ -1,0 +1,21 @@
+.input:focus-within {
+  border-color: var(--mb-color-core-brand);
+}
+
+.pillContent {
+  color: var(--mb-color-text-primary);
+}
+
+.optionContent {
+  flex: 1;
+}
+
+.optionIcon {
+  flex-shrink: 0;
+}
+
+.disabledInfoIcon {
+  color: var(--mb-color-text-secondary);
+  flex-shrink: 0;
+  margin-left: auto;
+}

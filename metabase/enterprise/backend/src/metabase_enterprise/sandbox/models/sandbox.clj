@@ -1,0 +1,343 @@
+(ns metabase-enterprise.sandbox.models.sandbox
+  "Model definition for sandboxes, aka Group Table Access Policies (old name). A sandbox is used to control access to a
+  certain Table for a certain PermissionsGroup. Whenever a member of that group attempts to query the Table in question,
+  a Saved Question specified by the GTAP is instead used as the source of the query.
+
+  See documentation in [[metabase.permissions.models.permissions]] for more information about the Metabase permissions
+  system."
+  (:require
+   [clojure.set :as set]
+   [medley.core :as m]
+   [metabase-enterprise.sandbox.db :as sandbox.db]
+   [metabase-enterprise.sandbox.dependencies :as sandbox.dependencies]
+   [metabase-enterprise.sandbox.schema :as sandbox.schema]
+   [metabase.api.common :as api]
+   [metabase.app-db.copy-spec :as app-db-copy]
+   [metabase.audit-app.core :as audit]
+   [metabase.dependencies.core :as dependencies]
+   [metabase.events.core :as events]
+   [metabase.lib-be.core :as lib-be]
+   [metabase.lib.core :as lib]
+   [metabase.lib.schema.id :as lib.schema.id]
+   [metabase.lib.schema.metadata :as lib.schema.metadata]
+   [metabase.models.interface :as mi]
+   [metabase.permissions.core :as perms]
+   [metabase.premium-features.core :refer [defenterprise]]
+   [metabase.queries.schema :as queries.schema]
+   [metabase.query-processor.error-type :as qp.error-type]
+   [metabase.query-processor.preprocess :as qp.preprocess]
+   [metabase.query-processor.schema :as qp.schema]
+   [metabase.request.core :as request]
+   [metabase.util :as u]
+   [metabase.util.i18n :refer [tru]]
+   [metabase.util.malli :as mu]
+   [metabase.warehouses.models.database :as database]
+   [methodical.core :as methodical]
+   [toucan2.core :as t2]))
+
+(set! *warn-on-reflection* true)
+
+;;; --------------------------------------------------- Definition ---------------------------------------------------
+
+(methodical/defmethod t2/table-name :model/Sandbox [_model] :sandboxes)
+
+(doto :model/Sandbox
+  (derive :metabase/model)
+  ;;; only admins can work with sandboxes
+  (derive ::mi/read-policy.superuser)
+  (derive ::mi/write-policy.superuser)
+  (derive :hook/events))
+
+(t2/deftransforms :model/Sandbox
+  {:attribute_remappings sandbox.schema/attribute-remappings-transform})
+
+;;; ----------------------------------------------------- Hooks ------------------------------------------------------
+
+(defn table-field-names->cols
+  "Return a mapping of field names to corresponding cols for given table."
+  [table-id]
+  (into {} (for [col (request/as-admin
+                       (qp.preprocess/query->expected-cols
+                        {:database (database/table-id->database-id table-id)
+                         :type     :query
+                         :query    {:source-table table-id}}))]
+             [(:name col) col])))
+
+(mu/defn check-column-types-match
+  "Assert that the base type of `col`, returned by a GTAP source query, matches the base type of `table-col`, a column
+  from the original Table being sandboxed."
+  [col       :- [:or
+                 ::lib.schema.metadata/column
+                 ::qp.schema/result-metadata.column]
+   table-col :- [:maybe [:or
+                         ::lib.schema.metadata/column
+                         ::qp.schema/result-metadata.column]]]
+  ;; These errors might get triggered by API endpoints or by the QP (this code is used in the
+  ;; `sandboxing` middleware). So include `:type` and `:status-code` information in the ExceptionInfo
+  ;; data so it can be passed along if applicable.
+  (when-let [table-col-base-type ((some-fn :base-type :base_type) table-col)]
+    (let [col-base-type ((some-fn :base-type :base_type) col)]
+      (when-not (isa? col-base-type table-col-base-type)
+        (let [msg (tru "Sandbox Questions can''t return columns that have different types than the Table they are sandboxing.")]
+          (throw (ex-info msg
+                          {:type          qp.error-type/bad-configuration
+                           :status-code   400
+                           :message       msg
+                           :new-col       col
+                           :expected      table-col-base-type
+                           :actual        (:base_type col)
+                           :response/keys #{:expected :actual}})))))))
+
+(mu/defn check-columns-match-table
+  "Make sure the result metadata data columns for the Card associated with a sandbox match up with the columns in the Table
+  that's getting sandboxed The base types of the Card columns can derive from the respective base types of the columns in
+  the Table itself, but you cannot return an entirely different type. Extra columns in the sandboxing Card are ignored."
+  ([{card-id :card_id, table-id :table_id} :- [:map
+                                               [:card_id {:optional true} [:maybe ::lib.schema.id/card]]
+                                               [:table_id ::lib.schema.id/table]]]
+   ;; not all sandboxes have Cards
+   (when card-id
+     ;; not all Cards have saved result metadata
+     (when-let [result-metadata (not-empty (sandbox.db/card-result-metadata card-id))]
+       (check-columns-match-table table-id result-metadata))))
+
+  ([table-id :- ::lib.schema.id/table
+    result-metadata-columns :- [:maybe ::queries.schema/card.result-metadata]]
+   (let [table-cols (table-field-names->cols table-id)]
+     (doseq [col   result-metadata-columns
+             :let  [table-col (get table-cols (:name col))]
+             :when table-col]
+       (check-column-types-match col table-col)))))
+
+(defn- remove-native-access!
+  "Downgrades the native query access of the group of `sandbox` to the query builder on the Database of its Table, where
+  the group has native access to that Table."
+  [{:keys [table_id group_id]}]
+  (let [db-id (database/table-id->database-id table_id)]
+    (when (= :query-builder-and-native
+             (get (perms/table-permissions-for-groups #{group_id} :perms/create-queries {table_id db-id}) table_id))
+      (perms/set-database-permission! group_id db-id :perms/create-queries :query-builder))))
+
+(t2/define-before-insert :model/Sandbox
+  [sandbox]
+  (check-columns-match-table sandbox)
+  (remove-native-access! sandbox)
+  sandbox)
+
+(t2/define-before-update :model/Sandbox
+  [sandbox]
+  (let [changes (t2/changes sandbox)]
+    (when (contains? changes :table_id)
+      (throw (ex-info (tru "You cannot change the table of a sandbox.")
+                      {:id (:id sandbox), :status-code 400})))
+    (when (contains? changes :group_id)
+      (throw (ex-info (tru "You cannot change the group of a sandbox.")
+                      {:id (:id sandbox), :status-code 400})))
+    (when (contains? changes :card_id)
+      (check-columns-match-table sandbox))
+    sandbox))
+
+;;; --------------------------------------------- Sandbox dependency set ---------------------------------------------
+
+(defn- sandbox-dependency-set
+  "The sandbox dependency set: every Card, snippet, Segment, and Measure some sandbox's policy reads at any depth, as a
+  map of entity kind (`:card`, `:snippet`, `:segment`, `:measure`) to ids. The Cards sandboxes name directly are in
+  `:card` alongside everything those Cards read."
+  []
+  ;; Each Card gets its own walk because the metadata provider is scoped to a single Database, and sandboxing Cards span
+  ;; Databases. A possible future optimization: Cards, Segments, and Measures belong to one Database, so a check on one
+  ;; of those could walk only the sandboxing Cards on the same Database. Snippets are not tied to a Database, so a
+  ;; snippet check would still need every sandboxing Card.
+  (let [cards (sandbox.db/sandboxing-cards)]
+    (-> (transduce (keep (fn [{:keys [dataset_query database_id]}]
+                           (when (seq dataset_query)
+                             (lib/all-referenced-entity-ids-recursive
+                              (lib/query (lib-be/application-database-metadata-provider database_id) dataset_query)))))
+                   (completing (partial merge-with set/union))
+                   {:card (into #{} (map :id) cards), :snippet #{}, :segment #{}, :measure #{}}
+                   cards)
+        (select-keys [:card :snippet :segment :measure]))))
+
+(defn- non-admin-affects-sandboxing-with-any?
+  "Whether the current user is a non-admin and one of the `entity-kind` (`:card`, `:snippet`, `:segment`, or `:measure`)
+  entities with `ids` is in the sandbox dependency set, which is computed once for all of them."
+  [entity-kind ids]
+  (boolean (and (seq ids)
+                api/*current-user-id*
+                (not api/*is-superuser?*)
+                (some (get (sandbox-dependency-set) entity-kind) ids))))
+
+(defn- non-admin-affects-sandboxing?
+  "Whether the current user is a non-admin and the `entity-kind` entity with `id` is in the sandbox dependency set."
+  [entity-kind id]
+  (non-admin-affects-sandboxing-with-any? entity-kind (when id [id])))
+
+(defn- check-result-metadata-still-matches-sandboxed-tables
+  "Throws if `new-result-metadata` would stop matching the Tables the sandboxes built out of this Card sandbox: the
+  Card cannot add fields or change types vs. the original Table."
+  [card-id new-result-metadata]
+  (when-let [gtaps-using-this-card (not-empty (sandbox.db/sandboxes-using-card card-id))]
+    (let [original-result-metadata (sandbox.db/card-result-metadata card-id)]
+      (when-not (= original-result-metadata new-result-metadata)
+        (doseq [{table-id :table_id} gtaps-using-this-card]
+          (try
+            (check-columns-match-table table-id new-result-metadata)
+            (catch clojure.lang.ExceptionInfo e
+              (throw (ex-info (str (tru "Cannot update Card: Card is used for Sandboxing, and updates would violate sandbox rules.")
+                                   " "
+                                   (.getMessage e))
+                              (ex-data e)
+                              e)))))))))
+
+(defenterprise pre-update-check-sandbox-constraints
+  "Throws when `changes` give a Card result metadata that no longer matches the Tables of the sandboxes that use it."
+  :feature :sandboxes
+  [{new-result-metadata :result_metadata, card-id :id} changes]
+  (when (contains? changes :result_metadata)
+    (check-result-metadata-still-matches-sandboxed-tables card-id new-result-metadata)))
+
+(defenterprise sandboxes-allow-result-metadata-write?
+  "Whether sandboxing lets the current user store result metadata for the Card with `card-id`: only an admin may for one
+  in the sandbox dependency set."
+  :feature :sandboxes
+  [card-id]
+  (not (non-admin-affects-sandboxing? :card card-id)))
+
+(defenterprise sandboxes-allow-card-update?
+  "Whether sandboxing lets the current user apply `changes`, the `:dataset_query`, `:archived` or `:result_metadata` of
+  a Card that really change, to a Card: only an admin may change them on one in the sandbox dependency set."
+  :feature :sandboxes
+  [{card-id :id} changes]
+  (not (and (some #(contains? changes %) [:dataset_query :archived :result_metadata])
+            (non-admin-affects-sandboxing? :card card-id))))
+
+(defenterprise sandboxes-allow-cards-update?
+  "Whether sandboxing lets the current user change the `:dataset_query`, `:archived` or `:result_metadata` of every one
+  of `cards`: only an admin may when one of them is in the sandbox dependency set."
+  :feature :sandboxes
+  [cards]
+  (not (non-admin-affects-sandboxing-with-any? :card (keep :id cards))))
+
+(defenterprise sandboxes-allow-card-delete?
+  "Whether sandboxing lets the current user delete a Card: only an admin may delete one in the sandbox dependency set."
+  :feature :sandboxes
+  [{card-id :id}]
+  (not (non-admin-affects-sandboxing? :card card-id)))
+
+(defenterprise sandboxes-allow-snippet-update?
+  "Whether sandboxing lets the current user apply `changes` to a snippet: only an admin may change the `:content`,
+  `:name` or `:archived` of one in the sandbox dependency set."
+  :feature :sandboxes
+  [{snippet-id :id} changes]
+  (not (and (some #(contains? changes %) [:content :name :archived])
+            (non-admin-affects-sandboxing? :snippet snippet-id))))
+
+(defenterprise sandboxes-allow-snippets-update?
+  "Whether sandboxing lets the current user apply `changes` to every one of `snippets`: only an admin may change the
+  `:content`, `:name` or `:archived` of one in the sandbox dependency set."
+  :feature :sandboxes
+  [snippets changes]
+  (not (and (some #(contains? changes %) [:content :name :archived])
+            (non-admin-affects-sandboxing-with-any? :snippet (keep :id snippets)))))
+
+(defenterprise sandboxes-allow-segment-update?
+  "Whether sandboxing lets the current user apply `changes` to a Segment: only an admin may change the `:definition`
+  or `:archived` of one in the sandbox dependency set."
+  :feature :sandboxes
+  [{segment-id :id} changes]
+  (not (and (some #(contains? changes %) [:definition :archived])
+            (non-admin-affects-sandboxing? :segment segment-id))))
+
+(defenterprise sandboxes-allow-measure-update?
+  "Whether sandboxing lets the current user apply `changes` to a Measure: only an admin may change the `:definition`
+  or `:archived` of one in the sandbox dependency set."
+  :feature :sandboxes
+  [{measure-id :id} changes]
+  (not (and (some #(contains? changes %) [:definition :archived])
+            (non-admin-affects-sandboxing? :measure measure-id))))
+
+;;; ----------------------------------------------- Permissions graph ------------------------------------------------
+
+(defn- merge-sandbox-into-graph
+  "Merges a single sandboxing policy into the permissions graph. Adjusts permissions at the database or schema level,
+  ensuring table-level permissions are set appropriately."
+  [graph group-id table-id db-id schema perm-location sandbox-value]
+  (let [db-path (concat [group-id db-id] perm-location)
+        db-perm (get-in graph db-path)
+        schema-perm (get db-perm schema)
+        default-table-perm (cond
+                             (keyword? db-perm)     db-perm
+                             (keyword? schema-perm) schema-perm)
+        ;; If perms were set at the database or schema-level before, we might need to add granular values for all tables
+        ;; in the database or schema, so they show correctly in the UI.
+        tables (when (or (keyword? db-perm) (keyword? schema-perm))
+                 (sandbox.db/tables-of-database db-id (keyword? schema-perm) schema))
+        ;; Remove the overarching database or schema permission so that we can add the granular table-level permissions
+        graph (cond
+                (and tables (keyword? db-perm))
+                (m/dissoc-in graph db-path)
+
+                (and tables (keyword? schema-perm))
+                (m/dissoc-in graph (concat db-path [(or schema "")]))
+
+                :else
+                graph)
+        ;; Apply granular permissions to each table
+        granular-graph (if tables
+                         (reduce (fn [g {:keys [id schema]}]
+                                   (assoc-in g (concat db-path [(or schema "") id]) default-table-perm))
+                                 graph
+                                 tables)
+                         graph)]
+    ;; Set `:segmented` (aka sandboxed) permissions for the target table
+    (assoc-in granular-graph
+              (concat db-path [(or schema "") table-id])
+              sandbox-value)))
+
+(defenterprise add-sandboxes-to-permissions-graph
+  "Augments a provided permissions graph with active sandboxing policies."
+  :feature :sandboxes
+  [graph & {:keys [group-ids group-id db-id audit?]}]
+  (let [sandboxes (sandbox.db/sandboxes-with-table-info group-id group-ids db-id (when-not audit? audit/audit-db-id))]
+    ;; Incorporate each sandbox policy into the permissions graph.
+    (reduce (fn [acc {:keys [group_id table_id db_id schema]}]
+              (merge-sandbox-into-graph acc group_id table_id db_id schema [:view-data] :sandboxed))
+            graph
+            sandboxes)))
+
+(defenterprise upsert-sandboxes!
+  "Create new `sandboxes` or update existing ones. If a sandbox has an `:id` it will be updated, otherwise it will be
+  created. New sandboxes must have a `:table_id` corresponding to a sandboxed query path in the `permissions` table;
+  if this does not exist, the sandbox will not be created."
+  :feature :sandboxes
+  [sandboxes]
+  (doall
+   (for [sandbox sandboxes]
+     (if-let [id (:id sandbox)]
+       ;; Only update `card_id` and/or `attribute_remappings` if the values are present in the body of the request.
+       ;; This allows existing values to be "cleared" by being set to nil
+       (do
+         (when (some #(contains? sandbox %) [:card_id :attribute_remappings])
+           (sandbox.db/update-sandbox! id (u/select-keys-when sandbox :present #{:card_id :attribute_remappings})))
+         (sandbox.db/sandbox id))
+       (sandbox.db/insert-sandbox! sandbox)))))
+
+;;; ----------------------------------------------------- Specs ------------------------------------------------------
+
+(defmethod events/spec :model/Sandbox
+  [_model]
+  {:create :event/sandbox-create
+   :update :event/sandbox-update
+   :delete :event/sandbox-delete})
+
+(defmethod app-db-copy/spec :model/Sandbox [_model]
+  {:skip?    false
+   :sequence "group_table_access_policy_id_seq"})
+
+(defmethod dependencies/spec :model/Sandbox [_model]
+  {:type  :sandbox
+   :items sandbox.db/dependency-sandbox-items
+
+   :dependencies sandbox.dependencies/dependencies
+
+   :dependency-columns #{:card_id}})

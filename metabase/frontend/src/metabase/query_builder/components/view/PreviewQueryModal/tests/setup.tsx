@@ -1,0 +1,77 @@
+import fetchMock from "fetch-mock";
+
+import { setupEnterpriseOnlyPlugin } from "__support__/enterprise";
+import { mockSettings } from "__support__/settings";
+import {
+  createMockQueryBuilderState,
+  createMockState,
+} from "__support__/state";
+import { createMockEntitiesState } from "__support__/store";
+import { renderWithProviders } from "__support__/ui";
+import * as Lib from "metabase-lib";
+import { SAMPLE_PROVIDER } from "metabase-lib/test-helpers";
+import type {
+  Card,
+  NativeDatasetResponse,
+  ParameterValuesMap,
+  TokenFeatures,
+} from "metabase-types/api";
+import {
+  createMockCard,
+  createMockDatabase,
+  createMockTokenFeatures,
+} from "metabase-types/api/mocks";
+
+import { PreviewQueryModal } from "..";
+
+export interface SetupOpts {
+  showMetabaseLinks?: boolean;
+  tokenFeatures?: Partial<TokenFeatures>;
+  enterprisePlugins?: Parameters<typeof setupEnterpriseOnlyPlugin>[0][];
+  card?: Card;
+  parameterValues?: ParameterValuesMap;
+  nativeQueryResponse?: NativeDatasetResponse;
+}
+
+export const setup = ({
+  showMetabaseLinks = true,
+  tokenFeatures = {},
+  enterprisePlugins = [],
+  card = createMockCard({
+    query_type: "native",
+    dataset_query: Lib.createTestJsNativeQuery(SAMPLE_PROVIDER, {
+      query: "SELECT 1",
+    }),
+  }),
+  parameterValues = {},
+  nativeQueryResponse,
+}: SetupOpts = {}) => {
+  const state = createMockState({
+    qb: createMockQueryBuilderState({ card, parameterValues }),
+    entities: createMockEntitiesState({
+      databases: [createMockDatabase()],
+      questions: [card],
+    }),
+    settings: mockSettings({
+      "show-metabase-links": showMetabaseLinks,
+      "token-features": createMockTokenFeatures(tokenFeatures),
+    }),
+  });
+
+  enterprisePlugins.forEach((plugin) => {
+    setupEnterpriseOnlyPlugin(plugin);
+  });
+
+  fetchMock.post(
+    "path:/api/dataset/native",
+    nativeQueryResponse ?? {
+      status: 500,
+      body: {
+        message:
+          'Cannot run the query: missing required parameters: #{"value"}',
+      },
+    },
+  );
+
+  renderWithProviders(<PreviewQueryModal />, { storeInitialState: state });
+};

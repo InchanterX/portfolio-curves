@@ -1,0 +1,182 @@
+import cx from "classnames";
+import type { HTMLAttributes, JSX, ReactNode } from "react";
+import { useEffect, useState } from "react";
+import { t } from "ttag";
+
+import type { UndoVariant } from "metabase/redux/store/undo";
+import { Button, Group, Icon, Notification, Portal, Text } from "metabase/ui";
+
+import S from "./Toaster.module.css";
+
+// `color` is omitted because the native HTML attribute's `string` type
+// conflicts with Mantine's `NotificationProps["color"]` union.
+export interface ToastProps extends Omit<
+  HTMLAttributes<HTMLDivElement>,
+  "color"
+> {
+  message: string;
+  confirmText?: string;
+  confirmAriaLabel?: string;
+  closeAriaLabel?: string;
+  show: boolean;
+  fixed?: boolean;
+  canClose?: boolean;
+  secondaryText?: string;
+  secondaryAriaLabel?: string;
+  leftSection?: ReactNode;
+  rightSection?: ReactNode;
+  variant?: UndoVariant;
+  onConfirm?: () => void;
+  onDismiss?: () => void;
+  onSecondary?: () => void;
+  "data-testid"?: string;
+}
+
+export const Toast = ({
+  message,
+  confirmText = t`Turn on`,
+  confirmAriaLabel = t`Confirm`,
+  closeAriaLabel = t`Close`,
+  show,
+  fixed,
+  canClose = true,
+  secondaryText,
+  secondaryAriaLabel = t`Cancel`,
+  leftSection,
+  rightSection,
+  variant = "neutral",
+  onConfirm,
+  onDismiss,
+  onSecondary,
+  className,
+  "data-testid": dataTestId = "toast",
+  ...divProps
+}: ToastProps): JSX.Element => {
+  const hasActions = Boolean(
+    onConfirm || (secondaryText && onSecondary) || rightSection,
+  );
+  const isColored = variant !== "neutral";
+
+  return (
+    <Notification
+      className={cx(S.toast, className)}
+      classNames={{
+        icon: S.icon,
+        body: S.body,
+        closeButton: S.dismiss,
+      }}
+      data-testid={dataTestId}
+      data-variant={variant}
+      data-show={show ? true : undefined}
+      data-fixed={fixed ? true : undefined}
+      data-has-actions={hasActions ? true : undefined}
+      icon={leftSection}
+      withBorder={false}
+      withCloseButton={canClose}
+      onClose={onDismiss}
+      closeButtonProps={{
+        "aria-label": closeAriaLabel,
+        icon: <Icon name="close" size={12} />,
+      }}
+      {...divProps}
+    >
+      <Group gap="xl" align="center" wrap="nowrap">
+        <Text
+          className={S.message}
+          flex={1}
+          c={isColored ? "text-primary" : "tooltip-text"}
+          fz="md"
+        >
+          {message}
+        </Text>
+        {hasActions && (
+          <Group gap="sm" align="center" wrap="nowrap">
+            {secondaryText && onSecondary && (
+              <Button
+                variant={isColored ? "default" : "on-dark-secondary"}
+                size="sm"
+                onClick={onSecondary}
+                aria-label={secondaryAriaLabel}
+              >
+                {secondaryText}
+              </Button>
+            )}
+            {onConfirm && (
+              <Button
+                variant={isColored ? "filled" : "on-dark-primary"}
+                color={isColored ? variant : undefined}
+                size="sm"
+                onClick={onConfirm}
+                aria-label={confirmAriaLabel}
+              >
+                {confirmText}
+              </Button>
+            )}
+            {rightSection}
+          </Group>
+        )}
+      </Group>
+    </Notification>
+  );
+};
+
+export interface ToasterProps extends HTMLAttributes<HTMLDivElement> {
+  message: string;
+  confirmText?: string;
+  isShown: boolean;
+  fixed?: boolean;
+  leftSection?: ReactNode;
+  rightSection?: ReactNode;
+  variant?: UndoVariant;
+  onConfirm: () => void;
+  onDismiss: () => void;
+}
+
+export const Toaster = ({
+  message,
+  confirmText = t`Turn on`,
+  isShown,
+  fixed,
+  leftSection,
+  rightSection,
+  variant,
+  onConfirm,
+  onDismiss,
+  className,
+  ...divProps
+}: ToasterProps): JSX.Element | null => {
+  const [open, setOpen] = useState(false);
+  const [render, setRender] = useState(false);
+
+  useEffect(() => {
+    if (isShown) {
+      setRender(true);
+      setTimeout(() => {
+        setOpen(true);
+      }, 100);
+    } else {
+      setOpen(false);
+      setTimeout(() => {
+        setRender(false);
+      }, 300);
+    }
+  }, [isShown]);
+
+  return render ? (
+    <Portal>
+      <Toast
+        message={message}
+        confirmText={confirmText}
+        show={open}
+        fixed={fixed}
+        leftSection={leftSection}
+        rightSection={rightSection}
+        variant={variant}
+        onConfirm={onConfirm}
+        onDismiss={onDismiss}
+        className={className}
+        {...divProps}
+      />
+    </Portal>
+  ) : null;
+};

@@ -1,0 +1,185 @@
+import { t } from "ttag";
+
+import {
+  AccordionList,
+  type Section,
+} from "metabase/common/components/AccordionList";
+import { useTranslateContent } from "metabase/content-translation/hooks";
+import CS from "metabase/css/core/index.css";
+import type {
+  DataSelectorDatabase,
+  DataSelectorSchema,
+  DataSelectorTable,
+} from "metabase/querying/common/components/DataSelector";
+import { Box, Flex, Icon, UnstyledButton, rem } from "metabase/ui";
+import { isSyncCompleted } from "metabase/utils/syncing";
+import { isNotNull } from "metabase/utils/types";
+import { getSchemaDisplayName } from "metabase-lib/v1/metadata/utils/schema";
+
+import { DataSelectorSectionHeader } from "../DataSelectorSectionHeader";
+import { CONTAINER_WIDTH } from "../constants";
+
+type DataSelectorTablePickerProps = {
+  hasFiltering?: boolean;
+  hasInitialFocus?: boolean;
+  hasNextStep?: boolean;
+  isLoading?: boolean;
+  minTablesToShowSearch?: number;
+  schemas: DataSelectorSchema[];
+  selectedDatabase?: DataSelectorDatabase | null;
+  selectedSchema?: DataSelectorSchema | null;
+  selectedTable?: DataSelectorTable | null;
+  tables: DataSelectorTable[];
+  onBack?: (() => void) | null;
+  onChangeTable: (table: DataSelectorTable) => void;
+};
+
+type Item = {
+  name: string;
+  table: DataSelectorTable;
+  database: DataSelectorDatabase;
+};
+
+type HeaderProps = Pick<
+  DataSelectorTablePickerProps,
+  "schemas" | "selectedSchema" | "onBack"
+> & {
+  // narrowed by the caller's early return; the header always has a database
+  selectedDatabase: DataSelectorDatabase;
+};
+
+export const DataSelectorTablePicker = ({
+  schemas,
+  tables,
+  selectedDatabase,
+  selectedSchema,
+  selectedTable,
+  onChangeTable,
+  hasNextStep,
+  onBack,
+  isLoading,
+  hasFiltering,
+  minTablesToShowSearch = 10,
+  hasInitialFocus,
+}: DataSelectorTablePickerProps) => {
+  const tc = useTranslateContent();
+
+  // In case DataSelector props get reset
+  if (!selectedDatabase) {
+    if (onBack) {
+      onBack();
+    }
+    return null;
+  }
+
+  const header = (
+    <Header
+      onBack={onBack}
+      schemas={schemas}
+      selectedDatabase={selectedDatabase}
+      selectedSchema={selectedSchema}
+    />
+  );
+
+  if (tables.length > 0 || isLoading) {
+    const sections: Section<Item>[] = [
+      {
+        name: header,
+        items: tables.filter(isNotNull).map((table) => ({
+          name: tc(table.display_name),
+          table: table,
+          database: selectedDatabase,
+        })),
+        loading: tables.length === 0 && isLoading,
+        type: "back",
+      },
+    ];
+
+    const checkIfItemIsClickable = ({ table }: { table: DataSelectorTable }) =>
+      table && isSyncCompleted(table);
+
+    const checkIfItemIsSelected = ({ table }: { table: DataSelectorTable }) =>
+      table && selectedTable ? table.id === selectedTable.id : false;
+
+    const renderItemIcon = ({ table }: { table: DataSelectorTable }) =>
+      table ? <Icon name="table" /> : null;
+
+    const showSpinner = (itemOrSection: Item | Section<Item>) =>
+      "table" in itemOrSection && !isSyncCompleted(itemOrSection.table);
+
+    const handleChange = ({ table }: { table: DataSelectorTable }) =>
+      onChangeTable(table);
+
+    const isSearchable = hasFiltering && tables.length >= minTablesToShowSearch;
+
+    return (
+      <Box w={rem(300)} style={{ overflowY: "auto" }}>
+        <AccordionList<Item>
+          id="TablePicker"
+          key="tablePicker"
+          className={CS.textBrand}
+          hasInitialFocus={hasInitialFocus}
+          sections={sections}
+          maxHeight={Infinity}
+          width="100%"
+          searchable={isSearchable}
+          onChange={handleChange}
+          showSpinner={showSpinner}
+          itemIsSelected={checkIfItemIsSelected}
+          itemIsClickable={checkIfItemIsClickable}
+          renderItemIcon={renderItemIcon}
+          showItemArrows={hasNextStep}
+        />
+      </Box>
+    );
+  } else {
+    return (
+      <Box component="section" w={CONTAINER_WIDTH}>
+        <DataSelectorSectionHeader header={header} />
+        <Box p="4rem" ta="center">{t`No tables found in this database.`}</Box>
+      </Box>
+    );
+  }
+};
+
+const Header = ({
+  onBack,
+  schemas,
+  selectedDatabase,
+  selectedSchema,
+}: HeaderProps) => {
+  const tc = useTranslateContent();
+
+  return (
+    <Flex align="center" wrap="wrap">
+      <UnstyledButton
+        display="flex"
+        fz="inherit"
+        disabled={!onBack}
+        style={{ alignItems: "center" }}
+        onClick={onBack ?? undefined}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.stopPropagation();
+          }
+        }}
+      >
+        {onBack && <Icon name="chevronleft" size={18} aria-hidden />}
+        <Box component="span" ml="sm" data-testid="source-database">
+          {tc(selectedDatabase.name)}
+        </Box>
+      </UnstyledButton>
+
+      {selectedSchema?.name && schemas.length > 1 && (
+        <>
+          <Box component="span" mx="sm" c="text-secondary">
+            /
+          </Box>
+          <Box component="span" data-testid="source-schema" c="text-secondary">
+            {tc(getSchemaDisplayName(selectedSchema.name))}
+          </Box>
+        </>
+      )}
+    </Flex>
+  );
+};

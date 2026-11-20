@@ -124,7 +124,268 @@ def test_schema_cycle(database):
     cli.migrate("downgrade", "base")
     with database.connect() as connection:
         assert connection.scalar(text("SELECT to_regnamespace('calc')")) is None
+        assert connection.scalar(text("SELECT to_regnamespace('auth')")) is None
     cli.migrate("upgrade", "head")
+
+
+def test_only_curve_and_auth_tables_remain(connection):
+    """Keep portfolio data and private credentials outside reporting views."""
+    tables = set(
+        connection.scalars(
+            text(
+                "SELECT schemaname || '.' || tablename FROM pg_tables "
+                "WHERE schemaname IN ('ref', 'market', 'app', 'calc', 'audit', 'auth')"
+            )
+        )
+    )
+    assert tables == {
+        "ref.bucket_set",
+        "ref.time_bucket",
+        "market.ingestion_batch",
+        "market.curve",
+        "market.curve_point",
+        "app.methodology_version",
+        "app.scenario",
+        "calc.curve_run",
+        "calc.run_scenario",
+        "calc.base_curve_point",
+        "calc.base_point_source",
+        "calc.stressed_curve_point",
+        "audit.audit_log",
+        "auth.user_account",
+        "auth.user_session",
+        "auth.action_token",
+    }
+    views = set(
+        connection.scalars(
+            text("SELECT viewname FROM pg_views WHERE schemaname = 'mart'")
+        )
+    )
+    assert views == {"v_latest_curve", "v_curve", "v_stressed_curve"}
+    assert not connection.scalar(
+        text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'mart' "
+            "AND column_name IN ('password_hash', 'token_hash', 'email'))"
+        )
+    )
+
+
+def user_account(connection, email="viewer@example.test"):
+    """Insert an unconfirmed test account without creating real credentials."""
+    return connection.scalar(
+        text(
+            "INSERT INTO auth.user_account(email, display_name, password_hash) "
+            "VALUES (:email, 'Test user', 'synthetic-test-hash') RETURNING id"
+        ),
+        {"email": email},
+    )
+
+
+def test_user_roles_email_and_status(connection):
+    """Default to viewer and enforce unique emails, two roles and account states."""
+    user = user_account(connection)
+    params = {"user": user}
+    assert tuple(
+        connection.execute(
+            text("SELECT role, status FROM auth.user_account WHERE id = :user"), params
+        ).one()
+    ) == ("viewer", "pending")
+    reject(
+        connection,
+        "INSERT INTO auth.user_account(email, display_name, password_hash) VALUES ('VIEWER@example.test', 'Other', 'hash')",
+    )
+    reject(
+        connection,
+        "UPDATE auth.user_account SET role = 'admin' WHERE id = :user",
+        params,
+    )
+    reject(
+        connection,
+        "UPDATE auth.user_account SET status = 'unknown' WHERE id = :user",
+        params,
+    )
+    reject(
+        connection,
+        "UPDATE auth.user_account SET status = 'active' WHERE id = :user",
+        params,
+    )
+    connection.execute(
+        text(
+            "UPDATE auth.user_account SET role = 'editor', status = 'active', "
+            "email_confirmed_at = now(), updated_at = now() WHERE id = :user"
+        ),
+        params,
+    )
+    connection.execute(
+        text("UPDATE auth.user_account SET status = 'disabled' WHERE id = :user"),
+        params,
+    )
+
+
+def test_sessions_and_action_tokens(connection):
+    """Validate token hashes, lifetimes, user links and independent sessions."""
+    user = user_account(connection)
+    params = {"user": user}
+    connection.execute(
+        text(
+            "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES "
+            "(:user, repeat('a', 64), now() + interval '1 day'), "
+            "(:user, repeat('b', 64), now() + interval '1 day')"
+        ),
+        params,
+    )
+    connection.execute(
+        text(
+            "UPDATE auth.user_session SET revoked_at = now() WHERE token_hash = repeat('a', 64)"
+        )
+    )
+    assert (
+        connection.scalar(
+            text("SELECT count(*) FROM auth.user_session WHERE revoked_at IS NULL")
+        )
+        == 1
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES (:user, repeat('a', 64), now() + interval '1 day')",
+        params,
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES (:user, 'plaintext', now() + interval '1 day')",
+        params,
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES (:user, repeat('c', 64), now())",
+        params,
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES (:user + 1000000, repeat('c', 64), now() + interval '1 day')",
+        params,
+    )
+    reject(
+        connection,
+        "UPDATE auth.user_session SET revoked_at = created_at - interval '1 second'",
+    )
+    connection.execute(
+        text(
+            "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES "
+            "(:user, 'verify_email', repeat('c', 64), now() + interval '1 hour'), "
+            "(:user, 'reset_password', repeat('d', 64), now() + interval '1 hour')"
+        ),
+        params,
+    )
+    connection.execute(
+        text(
+            "UPDATE auth.action_token SET used_at = now() WHERE purpose = 'verify_email'"
+        )
+    )
+    assert (
+        connection.scalar(
+            text("SELECT count(*) FROM auth.action_token WHERE used_at IS NULL")
+        )
+        == 1
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user, 'verify_email', repeat('c', 64), now() + interval '1 hour')",
+        params,
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user, 'other', repeat('e', 64), now() + interval '1 hour')",
+        params,
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user, 'reset_password', repeat('e', 64), now())",
+        params,
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user, 'reset_password', 'plaintext', now() + interval '1 hour')",
+        params,
+    )
+    reject(
+        connection,
+        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user + 1000000, 'reset_password', repeat('e', 64), now() + interval '1 hour')",
+        params,
+    )
+    reject(
+        connection,
+        "UPDATE auth.action_token SET used_at = created_at - interval '1 second'",
+    )
+    reject(connection, "DELETE FROM auth.user_account WHERE id = :user", params)
+
+
+def test_user_authorship_and_immutability(connection):
+    """Retain user identities on immutable versions, runs and audit records."""
+    user = user_account(connection)
+    other = user_account(connection, "other@example.test")
+    inputs = curve_inputs(connection)
+    params = {**inputs, "user": user, "other": other}
+    connection.execute(
+        text(
+            "UPDATE app.methodology_version SET created_by_user_id = :user "
+            "WHERE code = 'irrbb_initial'"
+        ),
+        params,
+    )
+    reject(
+        connection,
+        "UPDATE app.methodology_version SET created_by_user_id = :user + 1000000 WHERE code = 'irrbb_initial'",
+        params,
+    )
+    reject(
+        connection,
+        "UPDATE app.methodology_version SET created_by_user_id = :user WHERE id = :methodology",
+        params,
+    )
+    scenario = connection.scalar(
+        text(
+            "INSERT INTO app.scenario(code, version_no, name, shift_type, created_by, created_by_user_id) "
+            "VALUES ('user_base', 1, 'User base', 'base', 'Test user', :user) RETURNING id"
+        ),
+        params,
+    )
+    reject(
+        connection,
+        "UPDATE app.scenario SET created_by_user_id = :other WHERE id = :scenario",
+        {**params, "scenario": scenario},
+    )
+    run = connection.scalar(
+        text(
+            "INSERT INTO calc.curve_run(curve_id, methodology_id, bucket_set_id, "
+            "reporting_date, created_by, created_by_user_id) VALUES "
+            "(:curve, :methodology, :grid, '2026-01-01', 'Test user', :user) RETURNING id"
+        ),
+        params,
+    )
+    connection.execute(
+        text("INSERT INTO calc.run_scenario VALUES (:run, :scenario)"),
+        {"run": run, "scenario": scenario},
+    )
+    reject(
+        connection,
+        "UPDATE calc.curve_run SET created_by_user_id = :other WHERE id = :run",
+        {**params, "run": run},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO audit.audit_log(actor, actor_user_id, action, entity_type, entity_id) "
+            "VALUES ('Test user', :user, 'test', 'test', 1)"
+        ),
+        params,
+    )
+    reject(connection, "UPDATE audit.audit_log SET actor_user_id = :other", params)
+    reject(
+        connection,
+        "INSERT INTO audit.audit_log(actor, actor_user_id, action, entity_type, entity_id) VALUES ('unknown', :user + 1000000, 'test', 'test', 1)",
+        params,
+    )
+    reject(connection, "DELETE FROM auth.user_account WHERE id = :user", params)
 
 
 def test_seed_data(connection):
@@ -160,9 +421,11 @@ def test_seed_data(connection):
     assert rows[-1].label == "30y" and rows[-1].upper_years is None
     assert connection.scalar(text("SELECT count(*) FROM app.scenario")) == 7
     draft = connection.execute(
-        text("SELECT status, x, floor_mode, ec_formula FROM app.methodology_version")
+        text("SELECT status, x, floor_mode FROM app.methodology_version")
     ).one()
-    assert tuple(draft) == ("draft", None, None, None)
+    assert tuple(draft) == ("draft", None, None)
+    for table in ("user_account", "user_session", "action_token"):
+        assert connection.scalar(text(f"SELECT count(*) FROM auth.{table}")) == 0
 
 
 def test_draft_and_incomplete_methodology_rejected(connection):
@@ -277,85 +540,6 @@ def test_base_scenario_required_at_commit(connection):
             text("DELETE FROM calc.run_scenario WHERE curve_run_id = :run"), data
         )
         connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
-
-
-def test_portfolio_membership_and_nii_horizon(connection):
-    """Keep instrument results inside the selected snapshot and require NII horizon."""
-    data = curve_run(connection, curve_inputs(connection))
-    connection.execute(
-        text("UPDATE calc.curve_run SET status = 'succeeded' WHERE id = :run"), data
-    )
-    snapshots = []
-    instruments = []
-    for _ in range(2):
-        snapshot = connection.scalar(
-            text(
-                "INSERT INTO app.portfolio_snapshot(as_of_date, source_file_name, source_file_sha256, uploaded_by) VALUES ('2026-01-01', 'test', repeat('b', 64), 'test') RETURNING id"
-            )
-        )
-        instrument = connection.scalar(
-            text(
-                "INSERT INTO app.instrument(snapshot_id, external_id, instrument_type, balance_side, currency_code, notional, rate_type) VALUES (:snapshot, 'test', 'loan', 'asset', 'RUB', 100, 'fixed') RETURNING id"
-            ),
-            {"snapshot": snapshot},
-        )
-        connection.execute(
-            text(
-                "INSERT INTO app.instrument_cashflow(instrument_id, flow_date, cashflow_type, amount) VALUES (:instrument, '2027-01-01', 'principal', -100)"
-            ),
-            {"instrument": instrument},
-        )
-        connection.execute(
-            text(
-                "UPDATE app.portfolio_snapshot SET status = 'validated' WHERE id = :snapshot"
-            ),
-            {"snapshot": snapshot},
-        )
-        snapshots.append(snapshot)
-        instruments.append(instrument)
-    portfolio = connection.scalar(
-        text(
-            "INSERT INTO calc.portfolio_run(curve_run_id, portfolio_snapshot_id, reporting_date, methodology, created_by) VALUES (:run, :snapshot, '2026-01-01', '{}', 'test') RETURNING id"
-        ),
-        {**data, "snapshot": snapshots[0]},
-    )
-    params = {
-        **data,
-        "portfolio": portfolio,
-        "snapshot": snapshots[0],
-        "instrument": instruments[1],
-    }
-    reject(
-        connection,
-        "INSERT INTO calc.instrument_result VALUES (:portfolio, :run, :scenario, :snapshot, :instrument, 100, 0)",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO calc.scenario_result VALUES (:portfolio, :run, :scenario, 'RUB', 100, 0, 5, 0)",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO calc.scenario_result VALUES (:portfolio, :run, :scenario, 'USD', 100, 0, NULL, NULL)",
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE app.instrument SET notional = 200 WHERE id = :instrument",
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE app.instrument_cashflow SET amount = 200 WHERE instrument_id = :instrument",
-        params,
-    )
-    connection.execute(
-        text(
-            "INSERT INTO calc.instrument_result VALUES (:portfolio, :run, :scenario, :snapshot, :instrument, -100, -1)"
-        ),
-        {**params, "instrument": instruments[0]},
-    )
 
 
 def test_audit_and_mart_are_read_only(connection):

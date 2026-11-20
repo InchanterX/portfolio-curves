@@ -1,0 +1,482 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment -- FIXME: any-typed values */
+import { useUncontrolled } from "@mantine/hooks";
+import cx from "classnames";
+import {
+  type ComponentType,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import { usePrevious } from "react-use";
+import { t } from "ttag";
+
+import NoResultsImg from "assets/img/no_results.svg";
+import {
+  skipToken,
+  useGetCollectionItemsMetadataQuery,
+  useListCollectionItemsQuery,
+} from "metabase/api";
+import {
+  ALL_MODELS,
+  COLLECTION_PAGE_SIZE,
+  type CollectionContentTableColumn,
+  DEFAULT_VISIBLE_COLUMNS_LIST,
+  FILTERS_VISIBILITY_THRESHOLD,
+} from "metabase/collections/components/CollectionContent/constants";
+import CollectionEmptyState from "metabase/collections/components/CollectionEmptyState";
+import { trackCollectionItemsFiltered } from "metabase/common/collections/analytics";
+import type {
+  CreateBookmark,
+  DeleteBookmark,
+} from "metabase/common/collections/types";
+import { isRootTrashCollection } from "metabase/common/collections/utils";
+import { EmptyState } from "metabase/common/components/EmptyState";
+import { ItemsTable } from "metabase/common/components/ItemsTable";
+import { getVisibleColumnsMap } from "metabase/common/components/ItemsTable/utils";
+import { DelayedLoadingAndErrorWrapper } from "metabase/common/components/LoadingAndErrorWrapper/DelayedLoadingAndErrorWrapper";
+import { PaginationControls } from "metabase/common/components/PaginationControls";
+import { useDebouncedValue } from "metabase/common/hooks/use-debounced-value";
+import { usePagination } from "metabase/common/hooks/use-pagination";
+import CS from "metabase/css/core/index.css";
+import { Box } from "metabase/ui";
+import { SEARCH_DEBOUNCE_DURATION } from "metabase/utils/constants";
+import type {
+  Bookmark,
+  Collection,
+  CollectionId,
+  CollectionItem,
+  CollectionItemModel,
+  Database,
+  ListCollectionItemsRequest,
+  ListCollectionItemsSortColumn,
+  SortingOptions,
+} from "metabase-types/api";
+
+import { CollectionItemsToolbar } from "./CollectionItemsToolbar";
+import { getCollectionItemsScope } from "./utils";
+
+const shouldDebounceSearchText = (
+  _lastSearchText: string,
+  nextSearchText: string,
+) => nextSearchText.trim().length > 0;
+
+const getDefaultSortingOptions = (
+  collection: Collection | undefined,
+): SortingOptions<ListCollectionItemsSortColumn> => {
+  return isRootTrashCollection(collection)
+    ? {
+        sort_column: "last_edited_at",
+        sort_direction: "desc",
+      }
+    : {
+        sort_column: "name",
+        sort_direction: "asc",
+      };
+};
+
+// `itemsSorting` keeps the snake_case `SortingOptions` shape that `BaseItemsTable` emits, which is shared with
+// tables driving endpoints that still take snake_case (e.g. /api/ee/stale/:id). The collection items endpoint
+// takes kebab-case, so translate here rather than changing the shared UI type.
+const toItemsSortingParams = (
+  sorting: SortingOptions<ListCollectionItemsSortColumn>,
+) => ({
+  "sort-column": sorting.sort_column,
+  "sort-direction": sorting.sort_direction,
+});
+
+export type CollectionItemsTableProps = {
+  collectionId?: CollectionId;
+} & Partial<{
+  bookmarks: Bookmark[];
+  clear: () => void;
+  collection: Collection;
+  createBookmark: CreateBookmark;
+  databases: Database[];
+  deleteBookmark: DeleteBookmark;
+  EmptyContentComponent?: ComponentType<{
+    collection?: Collection;
+  }>;
+  getIsSelected: (item: CollectionItem) => boolean;
+  handleCopy: (items: CollectionItem[]) => void;
+  handleMove: (items: CollectionItem[]) => void;
+  models: CollectionItemModel[];
+  pageSize: number;
+  showDashboardQuestions: boolean;
+  selected: CollectionItem[];
+  selectOnlyTheseItems: (items: CollectionItem[]) => void;
+  showFilterBar: boolean;
+  toggleItem: (item: CollectionItem) => void;
+  /** Pass to control the type filter from outside; otherwise it is internal */
+  typeFilter: CollectionItemModel[] | null;
+  onTypeFilterChange: (filters: CollectionItemModel[] | null) => void;
+  visibleColumns?: CollectionContentTableColumn[];
+  onClick: (item: CollectionItem) => void;
+}>;
+
+const DefaultEmptyContentComponent = ({
+  collection,
+}: {
+  collection?: Collection;
+}) => {
+  return (
+    <Box mt="15vh">
+      <CollectionEmptyState collection={collection} />
+    </Box>
+  );
+};
+
+const CollectionNoResults = ({ hasSearchText }: { hasSearchText: boolean }) => (
+  <Box my="4rem" data-testid="collection-filter-empty-state">
+    <EmptyState
+      title={t`Didn't find anything`}
+      message={
+        hasSearchText
+          ? t`There weren't any results for your search.`
+          : t`No items of the selected types.`
+      }
+      illustrationElement={<img src={NoResultsImg} alt={t`No results`} />}
+    />
+  </Box>
+);
+
+export const CollectionItemsTable = (props: CollectionItemsTableProps) => {
+  // The sort order follows the user from collection to collection; search,
+  // type filter and page start over per collection through the remount.
+  const [itemsSorting, setItemsSorting] = useState<
+    SortingOptions<ListCollectionItemsSortColumn>
+  >(() => getDefaultSortingOptions(props.collection));
+
+  return (
+    <CollectionItemsTableForCollection
+      key={props.collectionId}
+      {...props}
+      itemsSorting={itemsSorting}
+      onItemsSortingChange={setItemsSorting}
+    />
+  );
+};
+
+type CollectionItemsTableForCollectionProps = CollectionItemsTableProps & {
+  itemsSorting: SortingOptions<ListCollectionItemsSortColumn>;
+  onItemsSortingChange: (
+    sorting: SortingOptions<ListCollectionItemsSortColumn>,
+  ) => void;
+};
+
+const CollectionItemsTableForCollection = ({
+  bookmarks,
+  collection,
+  collectionId,
+  clear,
+  createBookmark,
+  databases,
+  deleteBookmark,
+  EmptyContentComponent = DefaultEmptyContentComponent,
+  getIsSelected,
+  handleCopy,
+  handleMove,
+  models = ALL_MODELS,
+  pageSize = COLLECTION_PAGE_SIZE,
+  showFilterBar,
+  showDashboardQuestions = true,
+  selected,
+  selectOnlyTheseItems,
+  toggleItem,
+  typeFilter,
+  onTypeFilterChange,
+  itemsSorting,
+  onItemsSortingChange,
+  visibleColumns = DEFAULT_VISIBLE_COLUMNS_LIST,
+  onClick,
+}: CollectionItemsTableForCollectionProps) => {
+  const [searchText, setSearchText] = useState("");
+  const [selectedFilters, setSelectedFilters] = useUncontrolled<
+    CollectionItemModel[] | null
+  >({
+    value: typeFilter,
+    defaultValue: null,
+    finalValue: null,
+    onChange: onTypeFilterChange,
+  });
+  const debouncedSearchText = useDebouncedValue(
+    searchText,
+    SEARCH_DEBOUNCE_DURATION,
+    shouldDebounceSearchText,
+  );
+  const trimmedSearchText =
+    searchText.trim().length > 0 ? debouncedSearchText.trim() : "";
+  const previousTrimmedSearchText = usePrevious(trimmedSearchText);
+
+  const { handleNextPage, handlePreviousPage, setPage, page } = usePagination();
+
+  // The filter can also change from outside (the info panel's Contents counts),
+  // so the page restarts wherever the value changes, adjusted during render.
+  const [pagedFilters, setPagedFilters] = useState(selectedFilters);
+  if (pagedFilters !== selectedFilters) {
+    setPagedFilters(selectedFilters);
+    setPage(0);
+  }
+
+  useEffect(() => {
+    if (previousTrimmedSearchText === "" && trimmedSearchText.length > 0) {
+      trackCollectionItemsFiltered({ collectionId, filter: "search" });
+    }
+  }, [collectionId, previousTrimmedSearchText, trimmedSearchText]);
+
+  const handleSearchTextChange = useCallback(
+    (value: string) => {
+      setSearchText(value);
+      setPage(0);
+    },
+    [setPage],
+  );
+
+  const handleSelectedFiltersChange = useCallback(
+    (nextFilters: CollectionItemModel[] | null) => {
+      if (selectedFilters == null && nextFilters != null) {
+        trackCollectionItemsFiltered({ collectionId, filter: "type" });
+      }
+      setSelectedFilters(nextFilters);
+    },
+    [collectionId, selectedFilters, setSelectedFilters],
+  );
+
+  const handleItemsSortingChange = useCallback(
+    (sortingOpts: SortingOptions<ListCollectionItemsSortColumn>) => {
+      onItemsSortingChange(sortingOpts);
+      setPage(0);
+    },
+    [onItemsSortingChange, setPage],
+  );
+
+  const scope = getCollectionItemsScope(collection, {
+    models,
+    showDashboardQuestions,
+  });
+
+  // `currentData` is per collection, so a previous collection's metadata never drives this one's toolbar.
+  const { currentData: itemsMetadata } = useGetCollectionItemsMetadataQuery(
+    collectionId === undefined || !showFilterBar
+      ? skipToken
+      : { id: collectionId, ...scope },
+  );
+  const availableModels = itemsMetadata?.available_models ?? [];
+  const totalItems = itemsMetadata?.total_items ?? 0;
+
+  // An applied type filter keeps the toolbar visible in small collections and
+  // after archiving items, so it can always be seen and cleared.
+  const showToolbar =
+    Boolean(showFilterBar) &&
+    (totalItems > FILTERS_VISIBILITY_THRESHOLD || selectedFilters != null);
+  // The toolbar can disappear while a search is active, e.g. after archiving
+  // items; ignore the leftover search rather than filtering a bare list.
+  const appliedSearchText = showToolbar ? trimmedSearchText : "";
+  const appliedFilters = showToolbar ? selectedFilters : null;
+
+  return (
+    <CollectionItemsTableContent
+      bookmarks={bookmarks}
+      clear={clear}
+      collection={collection}
+      collectionId={collectionId}
+      createBookmark={createBookmark}
+      databases={databases}
+      deleteBookmark={deleteBookmark}
+      EmptyContentComponent={EmptyContentComponent}
+      getIsSelected={getIsSelected}
+      handleCopy={handleCopy}
+      handleMove={handleMove}
+      page={page}
+      pageSize={pageSize}
+      searchText={showToolbar ? searchText : ""}
+      selectedFilters={appliedFilters}
+      selected={selected}
+      selectOnlyTheseItems={selectOnlyTheseItems}
+      showToolbar={showToolbar}
+      toggleItem={toggleItem}
+      itemsSorting={itemsSorting}
+      itemsQuery={
+        collectionId === undefined
+          ? skipToken
+          : {
+              id: collectionId,
+              ...scope,
+              models: appliedFilters ?? scope.models,
+              limit: pageSize,
+              offset: pageSize * page,
+              ...toItemsSortingParams(itemsSorting),
+              ...(appliedSearchText.length > 0 ? { q: appliedSearchText } : {}),
+            }
+      }
+      availableModels={availableModels}
+      visibleColumns={visibleColumns}
+      onClick={onClick}
+      onNextPage={handleNextPage}
+      onPreviousPage={handlePreviousPage}
+      onSearchTextChange={handleSearchTextChange}
+      onSelectedFiltersChange={handleSelectedFiltersChange}
+      onItemsSortingChange={handleItemsSortingChange}
+    />
+  );
+};
+
+type CollectionItemsTableContentProps = CollectionItemsTableProps & {
+  page: number;
+  searchText: string;
+  selectedFilters: CollectionItemModel[] | null;
+  showToolbar: boolean;
+  availableModels: string[];
+  itemsSorting: SortingOptions<ListCollectionItemsSortColumn>;
+  itemsQuery: ListCollectionItemsRequest | typeof skipToken;
+  onNextPage: () => void;
+  onPreviousPage: () => void;
+  onSearchTextChange: (searchText: string) => void;
+  onSelectedFiltersChange: (filters: CollectionItemModel[] | null) => void;
+  onItemsSortingChange: (
+    itemsSorting: SortingOptions<ListCollectionItemsSortColumn>,
+  ) => void;
+  visibleColumns: CollectionContentTableColumn[];
+};
+
+const CollectionItemsTableContent = ({
+  bookmarks,
+  clear,
+  collection,
+  createBookmark,
+  databases,
+  deleteBookmark,
+  EmptyContentComponent = DefaultEmptyContentComponent,
+  getIsSelected,
+  handleCopy,
+  handleMove,
+  page,
+  pageSize = COLLECTION_PAGE_SIZE,
+  searchText,
+  selectedFilters,
+  selected,
+  selectOnlyTheseItems,
+  showToolbar,
+  availableModels,
+  toggleItem,
+  itemsSorting,
+  itemsQuery,
+  visibleColumns,
+  onClick,
+  onNextPage,
+  onPreviousPage,
+  onSearchTextChange,
+  onSelectedFiltersChange,
+  onItemsSortingChange,
+}: CollectionItemsTableContentProps) => {
+  const { data, isFetching, isLoading, error } =
+    useListCollectionItemsQuery(itemsQuery);
+
+  const items = data?.data ?? [];
+  const totalMatchingItems = data?.total;
+  const visibleColumnsMap = useMemo(
+    () => getVisibleColumnsMap(visibleColumns),
+    [visibleColumns],
+  );
+
+  const hasPagination: boolean = totalMatchingItems
+    ? totalMatchingItems > pageSize
+    : false;
+
+  const unselected = getIsSelected
+    ? items.filter((item) => !getIsSelected(item))
+    : items;
+  const hasUnselected = unselected.length > 0;
+
+  const handleSelectAll = () => {
+    selectOnlyTheseItems?.(items);
+  };
+
+  const hasSearchQuery =
+    itemsQuery !== skipToken && Boolean(itemsQuery.q?.trim());
+  const hasSearchText = searchText.trim().length > 0 || hasSearchQuery;
+  const hasActiveFilters = hasSearchText || selectedFilters != null;
+  const isSearching = isFetching && hasSearchQuery;
+  const hasNoItems = !isFetching && !error && items.length === 0;
+  const isEmpty = hasNoItems && !hasActiveFilters;
+
+  if (isEmpty) {
+    return <EmptyContentComponent collection={collection} />;
+  }
+
+  const showNoResults = hasNoItems && hasActiveFilters;
+  const showTable = !showNoResults;
+  // Shared by the skeleton and the loaded table, so both render the same header and columns.
+  const sharedTableProps = {
+    collection,
+    sortingOptions: itemsSorting,
+    onToggleSelected: toggleItem,
+    visibleColumnsMap,
+  };
+
+  return (
+    <>
+      {showToolbar && (
+        <CollectionItemsToolbar
+          searchText={searchText}
+          availableModels={availableModels}
+          selectedFilters={selectedFilters}
+          onSearchTextChange={onSearchTextChange}
+          onSelectedFiltersChange={onSelectedFiltersChange}
+          isSearching={isSearching}
+        />
+      )}
+      {showNoResults && <CollectionNoResults hasSearchText={hasSearchText} />}
+      {showTable && (
+        <Box data-testid="collection-table">
+          <DelayedLoadingAndErrorWrapper
+            error={error}
+            loading={isLoading}
+            loader={
+              <ItemsTable withSkeleton items={[]} {...sharedTableProps} />
+            }
+          >
+            <ItemsTable
+              {...sharedTableProps}
+              databases={databases}
+              bookmarks={bookmarks}
+              createBookmark={createBookmark}
+              deleteBookmark={deleteBookmark}
+              items={items}
+              onSortingOptionsChange={onItemsSortingChange}
+              selectedItems={selected}
+              hasUnselected={hasUnselected}
+              getIsSelected={getIsSelected}
+              onDrop={clear}
+              onMove={handleMove}
+              onCopy={handleCopy}
+              onSelectAll={handleSelectAll}
+              onSelectNone={clear}
+              onClick={onClick}
+            />
+          </DelayedLoadingAndErrorWrapper>
+          <div
+            className={cx(
+              CS.flex,
+              CS.justifyEnd,
+              CS.my3,
+              CS.syncStatusAwarePagination,
+            )}
+          >
+            {hasPagination && (
+              <PaginationControls
+                showTotal
+                page={page}
+                pageSize={pageSize}
+                total={totalMatchingItems}
+                itemsLength={items.length}
+                onNextPage={onNextPage}
+                onPreviousPage={onPreviousPage}
+              />
+            )}
+          </div>
+        </Box>
+      )}
+    </>
+  );
+};

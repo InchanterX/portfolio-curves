@@ -1,0 +1,42 @@
+import type { JSX, ReactNode } from "react";
+import { t } from "ttag";
+
+import CS from "metabase/css/core/index.css";
+import { ActionIcon, Group, Icon, Stack, Text } from "metabase/ui";
+import type { IconName } from "metabase-types/api";
+type ChannelSettingsBlockProps = {
+  title: string;
+  iconName: IconName;
+  children?: ReactNode;
+  onRemoveChannel: () => void;
+};
+
+export const ChannelSettingsBlock = ({
+  title,
+  iconName,
+  children,
+  onRemoveChannel,
+}: ChannelSettingsBlockProps): JSX.Element => {
+  return (
+    <Stack gap="0.75rem" w="100%" data-testid="channel-block">
+      <Group justify="space-between" align="center">
+        <Group gap="xxs" align="center">
+          <Icon name={iconName} />
+          <Text className={CS.textShortLineHeight}>{title}</Text>
+        </Group>
+
+        <ActionIcon
+          variant="subtle"
+          size="sm"
+          data-testid="remove-channel-button"
+          onClick={onRemoveChannel}
+          aria-label={t`Remove`}
+        >
+          <Icon name="close" />
+        </ActionIcon>
+      </Group>
+
+      {children}
+    </Stack>
+  );
+};

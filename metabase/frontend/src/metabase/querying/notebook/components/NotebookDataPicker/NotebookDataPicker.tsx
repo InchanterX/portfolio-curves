@@ -1,0 +1,377 @@
+/* eslint-disable @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment -- FIXME: any-typed values */
+import { useMemo, useState } from "react";
+import { useLatest } from "react-use";
+import { t } from "ttag";
+
+import {
+  useLazyGetCardQuery,
+  useLazyGetCardQueryMetadataQuery,
+  useLazyGetTableQueryMetadataQuery,
+} from "metabase/api";
+import type {
+  OmniPickerItem,
+  OmniPickerQuestionItem,
+  OmniPickerTableItem,
+} from "metabase/common/components/Pickers";
+import {
+  DataPickerModal,
+  getDataPickerValue,
+  shouldDisableItemNotInDb,
+} from "metabase/common/components/Pickers/DataPicker";
+import { MiniPicker } from "metabase/common/components/Pickers/MiniPicker";
+import type { MiniPickerSearchParams } from "metabase/common/components/Pickers/MiniPicker/context";
+import type {
+  MiniPickerItem,
+  MiniPickerPickableItem,
+} from "metabase/common/components/Pickers/MiniPicker/types";
+import { getIsTenantUser } from "metabase/current-user";
+import type { DataSource } from "metabase/embedding-sdk/types/components/data-picker";
+import { isEmbedding } from "metabase/embedding/config";
+import { selectMetadataProvider } from "metabase/metadata-store";
+import { useSelector, useStore } from "metabase/redux";
+import { Icon, TextInput } from "metabase/ui";
+import * as Lib from "metabase-lib";
+import type { CardId, TableId } from "metabase-types/api";
+
+import type { QueryEditorDatabasePickerItem } from "../../../editor/types";
+import {
+  type NotebookContextType,
+  useNotebookContext,
+} from "../Notebook/context";
+import { NotebookCellItem } from "../NotebookCell";
+
+import { EmbeddingDataPicker } from "./EmbeddingDataPicker";
+import { getMiniPickerDataSource, isObjectWithModel } from "./utils";
+
+const DATA_SOURCE_SEARCH_PARAMS: MiniPickerSearchParams = {
+  filter_items_in_personal_collection: "exclude-others",
+};
+
+export interface NotebookDataPickerProps {
+  title: string;
+  query: Lib.Query;
+  stageIndex: number;
+  table: Lib.TableMetadata | Lib.CardMetadata | undefined;
+  placeholder?: string;
+  canChangeDatabase: boolean;
+  hasMetrics: boolean;
+  hasMetricsInMiniPicker?: boolean;
+  isDisabled: boolean;
+  isOpened: boolean;
+  setIsOpened: (isOpened: boolean) => void;
+  onChange: (
+    table: Lib.TableMetadata | Lib.CardMetadata,
+    metadataProvider: Lib.MetadataProvider,
+  ) => void;
+  shouldDisableItem?: (item: OmniPickerItem) => boolean;
+  shouldDisableDatabase?: (item: QueryEditorDatabasePickerItem) => boolean;
+  columnPicker: React.ReactNode;
+  shouldShowLibrary?: boolean;
+}
+
+export function NotebookDataPicker({
+  title,
+  query,
+  stageIndex,
+  table,
+  placeholder = title,
+  canChangeDatabase,
+  hasMetrics,
+  hasMetricsInMiniPicker,
+  isDisabled,
+  isOpened,
+  setIsOpened,
+  onChange,
+  shouldDisableItem,
+  shouldDisableDatabase,
+  shouldShowLibrary,
+  columnPicker,
+}: NotebookDataPickerProps) {
+  const store = useStore();
+  const onChangeRef = useLatest(onChange);
+  const isEmbed = isEmbedding();
+  const isTenantUser = useSelector(getIsTenantUser);
+
+  const [fetchTable] = useLazyGetTableQueryMetadataQuery();
+  const [fetchCard] = useLazyGetCardQuery();
+  const [fetchCardQueryMetadata] = useLazyGetCardQueryMetadataQuery();
+
+  const loadTable = async (tableId: TableId) => {
+    const table = await fetchTable({ id: tableId }, true).unwrap();
+    const metadataProvider = selectMetadataProvider(
+      store.getState(),
+      table.db_id,
+    );
+    return {
+      metadataProvider,
+      table: Lib.tableOrCardMetadata(metadataProvider, tableId),
+    };
+  };
+
+  const loadCard = async (cardId: CardId) => {
+    const [card] = await Promise.all([
+      fetchCard({ id: cardId }, true).unwrap(),
+      fetchCardQueryMetadata(cardId, true).unwrap(),
+    ]);
+    const metadataProvider = selectMetadataProvider(
+      store.getState(),
+      card.database_id ?? null,
+    );
+    return {
+      metadataProvider,
+      table: Lib.cardMetadata(metadataProvider, cardId),
+    };
+  };
+
+  const handleChange = async (source: DataSource) => {
+    const { metadataProvider, table } =
+      source.type === "table"
+        ? await loadTable(source.id)
+        : await loadCard(source.id);
+    if (table) {
+      onChangeRef.current?.(table, metadataProvider);
+    }
+  };
+
+  const isRaw = useMemo(() => {
+    return (
+      Lib.aggregations(query, stageIndex).length === 0 &&
+      Lib.breakouts(query, stageIndex).length === 0
+    );
+  }, [query, stageIndex]);
+
+  // EMB-1144: force the embedding picker if user is a tenant user.
+  //           this is to support the sidecar use-case where tenant users are given instance logins.
+  if (isEmbed || isTenantUser) {
+    const canSelectTableColumns = table && isRaw && !isDisabled;
+    return (
+      <NotebookCellItem
+        color="background_surface-brand-strong"
+        inactive={!table}
+        right={canSelectTableColumns && columnPicker}
+        containerStyle={{ padding: 0 }}
+        rightContainerStyle={{ width: 37, padding: 0 }}
+        data-testid="data-step-cell"
+        disabled={isDisabled}
+      >
+        <EmbeddingDataPicker
+          query={query}
+          stageIndex={stageIndex}
+          table={table}
+          title={title}
+          placeholder={placeholder}
+          canChangeDatabase={canChangeDatabase}
+          isDisabled={isDisabled}
+          onChange={handleChange}
+        />
+      </NotebookCellItem>
+    );
+  } else {
+    return (
+      <ModernDataPicker
+        query={query}
+        stageIndex={stageIndex}
+        table={table}
+        title={title}
+        placeholder={placeholder}
+        canChangeDatabase={canChangeDatabase}
+        hasMetrics={hasMetrics}
+        hasMetricsInMiniPicker={hasMetricsInMiniPicker}
+        isOpened={isOpened}
+        setIsOpened={setIsOpened}
+        isDisabled={isDisabled}
+        onChange={handleChange}
+        shouldDisableItem={shouldDisableItem}
+        shouldDisableDatabase={shouldDisableDatabase}
+        shouldShowLibrary={shouldShowLibrary}
+      />
+    );
+  }
+}
+
+type ModernDataPickerProps = {
+  query: Lib.Query;
+  stageIndex: number;
+  table: Lib.TableMetadata | Lib.CardMetadata | undefined;
+  title: string;
+  placeholder: string;
+  isOpened: boolean;
+  setIsOpened: (isOpened: boolean) => void;
+  canChangeDatabase: boolean;
+  hasMetrics: boolean;
+  hasMetricsInMiniPicker?: boolean;
+  isDisabled: boolean;
+  onChange: (source: DataSource) => void;
+  shouldDisableItem?: (item: OmniPickerItem) => boolean;
+  shouldDisableDatabase?: (database: QueryEditorDatabasePickerItem) => boolean;
+  shouldShowLibrary?: boolean;
+};
+
+function ModernDataPicker({
+  query,
+  stageIndex,
+  table,
+  title,
+  isOpened,
+  setIsOpened,
+  canChangeDatabase,
+  hasMetrics,
+  hasMetricsInMiniPicker = hasMetrics,
+  isDisabled,
+  onChange,
+  shouldDisableItem,
+  shouldDisableDatabase,
+  shouldShowLibrary,
+}: ModernDataPickerProps) {
+  const context = useNotebookContext();
+  const getItemTooltip = context.dataPickerOptions?.getItemTooltip;
+  const modalModelList = getModelFilterList(context, hasMetrics);
+  const miniPickerModelList = getModelFilterList(
+    context,
+    hasMetrics && hasMetricsInMiniPicker,
+  );
+
+  const databaseId = Lib.databaseID(query) ?? undefined;
+
+  const tableValue =
+    table != null ? getDataPickerValue(query, stageIndex, table) : undefined;
+  const [dataSourceSearchQuery, setDataSourceSearchQuery] = useState("");
+  const [isBrowsing, setIsBrowsing] = useState(false);
+  const [focusPicker, setFocusPicker] = useState(false);
+
+  const shouldHide = useMemo(() => {
+    const shouldDisableBasedOnDb = !canChangeDatabase
+      ? shouldDisableItemNotInDb(databaseId)
+      : () => false;
+
+    return (item: MiniPickerItem | unknown): item is MiniPickerPickableItem => {
+      // FIXME: eww gross need to normalize db ids in minipicker
+      // @ts-expect-error - will fix when we align types with minipicker: UXW-2735
+      const dbId = item?.db_id ?? item?.database_id ?? item?.dbId ?? undefined;
+
+      return Boolean(
+        // @ts-expect-error - Please fix 🥺
+        shouldDisableBasedOnDb({ ...item, database_id: dbId }) ||
+        // Unjustified type cast. FIXME
+        shouldDisableItem?.(item as OmniPickerItem) ||
+        (isObjectWithModel(item) &&
+          item.model === "database" &&
+          // Unjustified type cast. FIXME
+          shouldDisableDatabase?.(item as QueryEditorDatabasePickerItem)),
+      );
+    };
+  }, [databaseId, canChangeDatabase, shouldDisableItem, shouldDisableDatabase]);
+
+  const handleMiniPickerChange = (item: MiniPickerPickableItem) => {
+    const source = getMiniPickerDataSource(item);
+    if (source != null) {
+      onChange(source);
+    }
+    setDataSourceSearchQuery("");
+    setIsOpened(false);
+  };
+
+  const handleModalChange = (
+    item: OmniPickerTableItem | OmniPickerQuestionItem,
+  ) => {
+    onChange(
+      item.model === "table"
+        ? { type: "table", id: item.id }
+        : { type: "card", id: item.id },
+    );
+  };
+
+  // when you can't change databases, let's default to
+  // selecting that database in the picker
+  const defaultDbValue =
+    canChangeDatabase || !databaseId
+      ? undefined
+      : {
+          id: databaseId,
+          model: "database" as const,
+        };
+
+  return (
+    <>
+      <MiniPicker
+        value={tableValue}
+        opened={isOpened && !isBrowsing}
+        onClose={() => setIsOpened(false)}
+        // minipicker doesn't support picking a database
+        models={miniPickerModelList.filter((model) => model !== "database")}
+        searchQuery={dataSourceSearchQuery}
+        searchParams={DATA_SOURCE_SEARCH_PARAMS}
+        onBrowseAll={() => setIsBrowsing(true)}
+        trapFocus={focusPicker}
+        onChange={handleMiniPickerChange}
+        shouldHide={shouldHide}
+        shouldShowLibrary={shouldShowLibrary}
+        menuDropdownProps={{
+          mt: "xxl",
+          ml: "-1rem",
+        }}
+      />
+      {isOpened && isBrowsing && (
+        <DataPickerModal
+          title={title}
+          value={tableValue ?? defaultDbValue}
+          onlyDatabaseId={canChangeDatabase ? undefined : databaseId}
+          models={modalModelList}
+          onChange={handleModalChange}
+          onClose={() => {
+            setIsBrowsing(false);
+            setIsOpened(false);
+          }}
+          shouldDisableItem={(i) => {
+            return Boolean(
+              shouldDisableItem?.(i) ||
+              ("model" in i &&
+                i.model === "database" &&
+                shouldDisableDatabase?.(i)),
+            );
+          }}
+          options={getItemTooltip ? { getItemTooltip } : undefined}
+          // searchQuery={dataSourceSearchQuery} ?
+        />
+      )}
+      {isOpened || !table ? (
+        <TextInput
+          placeholder={t`Search for tables and more...`}
+          value={dataSourceSearchQuery}
+          variant="unstyled"
+          styles={{
+            input: { background: "transparent ", border: "none", p: 0 },
+          }}
+          leftSection={<Icon name="search" />}
+          onChange={(e) => setDataSourceSearchQuery(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown" || e.key === "tab") {
+              e.preventDefault();
+              e.stopPropagation();
+              setFocusPicker(true);
+            }
+          }}
+          onClickCapture={(e) => {
+            e.stopPropagation();
+            setIsOpened(true);
+            setFocusPicker(false);
+          }}
+          miw="20rem"
+          autoFocus={isOpened}
+          disabled={isDisabled}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function getModelFilterList(
+  { modelsFilterList }: NotebookContextType,
+  hasMetrics: boolean,
+) {
+  if (hasMetrics) {
+    return modelsFilterList;
+  } else {
+    return modelsFilterList.filter((model) => model !== "metric");
+  }
+}

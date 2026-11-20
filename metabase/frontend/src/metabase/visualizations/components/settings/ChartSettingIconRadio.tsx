@@ -1,0 +1,39 @@
+import { ActionIcon, Icon } from "metabase/ui";
+import type { IconName } from "metabase-types/api";
+
+interface ChartSettingIconRadioProps {
+  value: string;
+  onChange: (val: string | null) => void;
+  options: { iconName: IconName; value: string }[];
+}
+
+export const ChartSettingIconRadio = ({
+  value,
+  options,
+  onChange,
+}: ChartSettingIconRadioProps) => {
+  const handleClick = (newValue: string) => {
+    if (newValue === value) {
+      onChange(null);
+    } else {
+      onChange(newValue);
+    }
+  };
+
+  return (
+    <div>
+      {options.map((option) => (
+        <ActionIcon
+          key={`radio-icon-${option.iconName}`}
+          variant="light"
+          aria-pressed={option.value === value}
+          selected={option.value === value}
+          ml="sm"
+          onClick={() => handleClick(option.value)}
+        >
+          <Icon name={option.iconName} />
+        </ActionIcon>
+      ))}
+    </div>
+  );
+};

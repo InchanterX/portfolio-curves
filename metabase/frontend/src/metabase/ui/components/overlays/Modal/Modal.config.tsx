@@ -1,0 +1,53 @@
+import { Modal } from "@mantine/core";
+import cx from "classnames";
+import { t } from "ttag";
+
+import Animation from "metabase/css/core/animation.module.css";
+import Layout from "metabase/css/core/layout.module.css";
+import ZIndex from "metabase/css/core/z-index.module.css";
+
+const DEFAULT_MODAL_SPACING = "xl";
+
+import Styles from "./Modal.module.css";
+
+export const modalOverrides = {
+  // `Modal` is built from the `Root` parts, so its defaults go on `ModalRoot`
+  Modal: Modal.extend({
+    classNames: {
+      root: Styles.root,
+      title: Styles.title,
+      overlay: cx(Styles.overlay, ZIndex.Overlay, Animation.fadeIn),
+      content: cx(Styles.content, ZIndex.Overlay, Animation.popInFromBottom),
+      inner: cx(ZIndex.Overlay, Layout.left, Animation.popInFromBottom),
+      header: Styles.header,
+      body: Styles.body,
+      close: Styles.ModalCloseButton,
+    },
+  }),
+
+  ModalRoot: Modal.Root.extend({
+    defaultProps: {
+      centered: true,
+      size: "lg",
+      shadow: "lg_outline",
+      radius: "lg",
+      padding: DEFAULT_MODAL_SPACING,
+      withinPortal: true,
+    },
+  }),
+
+  // The content is a Paper, which would otherwise use the Paper theme radius
+  ModalContent: Modal.Content.extend({
+    defaultProps: {
+      radius: "lg",
+    },
+  }),
+
+  ModalCloseButton: Modal.CloseButton.extend({
+    defaultProps: {
+      get "aria-label"() {
+        return t`Close`;
+      },
+    },
+  }),
+};

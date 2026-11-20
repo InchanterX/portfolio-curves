@@ -1,0 +1,189 @@
+import _ from "underscore";
+
+import { DEFAULT_FONT } from "embedding-sdk-bundle/config";
+import { applyThemePreset } from "embedding-sdk-shared/lib/apply-theme-preset";
+import type {
+  MetabaseColor,
+  MetabaseComponentTheme,
+  MetabaseTheme,
+} from "metabase/embedding-sdk/theme";
+import {
+  DEFAULT_EMBEDDED_COMPONENT_THEME,
+  DEFAULT_SDK_FONT_SIZE,
+  getEmbeddingComponentOverrides,
+} from "metabase/embedding-sdk/theme";
+import { getEmbeddingCartesianColors } from "metabase/embedding-sdk/theme/cartesian-colors";
+import type { MappableSdkColor } from "metabase/embedding-sdk/theme/embedding-color-palette";
+import {
+  SDK_MISSING_COLORS_FALLBACK,
+  SDK_TO_MAIN_APP_COLORS_MAPPING,
+  SDK_TO_MAIN_APP_TOOLTIP_COLORS_MAPPING,
+} from "metabase/embedding-sdk/theme/embedding-color-palette";
+import type { MantineThemeOverride } from "metabase/ui";
+import type {
+  MetabaseAccentColorKey,
+  MetabaseColorKey,
+} from "metabase/ui/colors";
+import { mapChartColorsToAccents } from "metabase/ui/colors/accents";
+import { mapWhitelabelColorsToTokens } from "metabase/ui/colors/constants/whitelabel-colors";
+import { deepMerge } from "metabase/utils/deep-merge";
+import type { ColorSettings } from "metabase-types/api";
+
+import { colorTuple } from "./color-tuple";
+
+const SDK_BASE_FONT_SIZE = `${DEFAULT_SDK_FONT_SIZE}px`;
+
+// Strip any key that has the value of "undefined"
+const stripUndefinedKeys = <T>(x: T): T =>
+  _.isObject(x)
+    ? // `_.pick`/`_.mapObject` only drop keys, so the result keeps the shape of `x`
+      (_.pick(
+        _.mapObject(x, stripUndefinedKeys),
+        (v) => !_.isUndefined(v),
+      ) as T)
+    : x;
+
+/**
+ * Transforms a public-facing Metabase theme configuration
+ * into a Mantine theme override for internal use.
+ */
+export function getEmbeddingThemeOverride(
+  userTheme: MetabaseTheme,
+  font: string | undefined,
+  whitelabeledColors?: ColorSettings | undefined,
+): MantineThemeOverride {
+  const theme = applyThemePreset(userTheme) ?? userTheme;
+  const { axisColor, gridlineColor } = getEmbeddingCartesianColors({
+    background: theme.colors?.background,
+    foreground: theme.colors?.["text-primary"],
+    border: userTheme.colors?.border,
+  });
+  const components: MetabaseComponentTheme = deepMerge(
+    deepMerge(DEFAULT_EMBEDDED_COMPONENT_THEME, {
+      cartesian: { splitLine: { lineStyle: { color: gridlineColor } } },
+    }),
+    stripUndefinedKeys(theme.components),
+  );
+
+  const override: MantineThemeOverride = {
+    // font is coming from either redux, where we store theme.fontFamily,
+    // or from the instance settings, we're adding a default to be used while loading the settings
+    fontFamily: font ?? DEFAULT_FONT,
+
+    ...(theme.lineHeight && { lineHeight: theme.lineHeight }),
+
+    other: {
+      ...components,
+      fontSize: theme.fontSize ?? SDK_BASE_FONT_SIZE,
+      hasCustomChartFontSize:
+        theme.fontSize !== undefined ||
+        theme.components?.cartesian?.label?.fontSize !== undefined,
+    },
+
+    components: getEmbeddingComponentOverrides(),
+    colors: { "chart-axis": colorTuple(axisColor) },
+  };
+
+  const whitelabeledTokens = mapWhitelabelColorsToTokens(whitelabeledColors);
+
+  for (const [key, value] of Object.entries<string | undefined>(
+    whitelabeledTokens,
+  )) {
+    if (value === undefined) {
+      continue;
+    }
+
+    if (!override.colors) {
+      override.colors = {};
+    }
+
+    // `Object.entries` widens `ColorPalette` keys to `string`, need to manually narrow it back
+    override.colors[key as MetabaseColorKey] = colorTuple(value);
+  }
+
+  if (theme.colors) {
+    if (!override.colors) {
+      override.colors = {};
+    }
+
+    const userColors = { ...theme.colors };
+
+    // Apply fallback colors for missing colors that the user forgot to define.
+    // For example, if they forgot to define `background-secondary` but have
+    // defined `background`, we use it as a fallback.
+    for (const key in SDK_MISSING_COLORS_FALLBACK) {
+      // Unjustified type cast. FIXME
+      const targetColor = key as MappableSdkColor;
+      const fallbackColor = SDK_MISSING_COLORS_FALLBACK[targetColor];
+
+      if (
+        fallbackColor &&
+        userColors[fallbackColor] &&
+        !userColors[targetColor]
+      ) {
+        userColors[targetColor] = userColors[fallbackColor];
+      }
+    }
+
+    // Apply color palette overrides
+    for (const name in userColors) {
+      // Unjustified type cast. FIXME
+      const color = userColors[name as MetabaseColor];
+
+      if (color && typeof color === "string") {
+        const themeColorNames =
+          // Unjustified type cast. FIXME
+          SDK_TO_MAIN_APP_COLORS_MAPPING[name as MappableSdkColor];
+
+        // If the sdk color does not exist in the mapping, skip it.
+        if (!themeColorNames) {
+          console.warn(
+            `Color ${name} does not exist in the Embedding SDK. Please remove it from the theme configuration.`,
+          );
+
+          continue;
+        }
+
+        for (const themeColorName of themeColorNames) {
+          override.colors[themeColorName] = colorTuple(color);
+        }
+      }
+    }
+
+    if (theme.colors.charts) {
+      const accents = mapChartColorsToAccents(theme.colors.charts);
+
+      for (const _accentKey in accents) {
+        // Unjustified type cast. FIXME
+        const accentKey = _accentKey as MetabaseAccentColorKey;
+        const accentColor = accents[accentKey];
+
+        if (!accentColor) {
+          continue;
+        }
+
+        override.colors[accentKey] = colorTuple(accentColor);
+      }
+    }
+  }
+
+  if (theme.components?.tooltip) {
+    if (!override.colors) {
+      override.colors = {};
+    }
+
+    for (const _tooltipKey in SDK_TO_MAIN_APP_TOOLTIP_COLORS_MAPPING) {
+      type TooltipKey = keyof NonNullable<MetabaseComponentTheme["tooltip"]>;
+      // Unjustified type cast. FIXME
+      const tooltipKey = _tooltipKey as TooltipKey;
+      const colorKey = SDK_TO_MAIN_APP_TOOLTIP_COLORS_MAPPING[tooltipKey];
+      const tooltipColor = theme.components.tooltip[tooltipKey];
+
+      if (tooltipColor && colorKey) {
+        override.colors[colorKey] = colorTuple(tooltipColor);
+      }
+    }
+  }
+
+  return override;
+}

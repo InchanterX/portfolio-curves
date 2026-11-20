@@ -1,0 +1,670 @@
+import "dotenv/config";
+import { WebClient } from "@slack/web-api";
+import type { Block, KnownBlock, MessageAttachment } from "@slack/web-api";
+import dayjs from "dayjs";
+import relativeTime from "dayjs/plugin/relativeTime";
+
+dayjs.extend(relativeTime);
+
+import _githubSlackMap from "../github-slack-map.json";
+
+const githubSlackMap: Record<string, string> = _githubSlackMap;
+
+import { findMilestone } from "./github";
+import type { Issue, ReleaseProps } from "./types";
+import { getGenericVersion } from "./version-helpers";
+
+const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
+const SLACK_CHANNEL_NAME = process.env.SLACK_RELEASE_CHANNEL ?? "bot-testing";
+
+export function mentionUserByGithubLogin(githubLogin?: string | null) {
+  if (githubLogin && githubLogin in githubSlackMap) {
+    return `<@${githubSlackMap[githubLogin]}>`;
+  }
+  return githubLogin ? `@${githubLogin}` : "@unassigned";
+}
+
+export function mentionSlackTeam(teamName: string) {
+  return `<!subteam^${githubSlackMap[teamName]}|${teamName}>`;
+}
+
+export function getChannelTopic(channelName: string) {
+  return slack.conversations
+    .list({
+      types: "public_channel",
+    })
+    .then((response) => {
+      const channel = response?.channels?.find(
+        (channel) => channel.name === channelName,
+      );
+      return channel?.topic?.value;
+    });
+}
+
+function formatBackportItem(issue: Omit<Issue, "labels">) {
+  const age = dayjs(issue.created_at).fromNow();
+  return `${mentionUserByGithubLogin(issue.assignee?.login)} - ${slackLink(issue.title, issue.html_url)} - ${age}`;
+}
+
+export async function sendBackportReminder({
+  channelName,
+  backports,
+}: {
+  channelName: string;
+  backports: Omit<Issue, "labels">[];
+}) {
+  const text = backports.reverse().map(formatBackportItem).join("\n");
+
+  const blocks = [
+    {
+      type: "header",
+      text: {
+        type: "plain_text",
+        text: `:shame-conga: ${backports.length} Open Backports :shame-conga:`,
+        emoji: true,
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `_${slackLink(
+          "See all open backports",
+          "https://github.com/metabase/metabase/pulls?q=is%3Aopen+is%3Apr+label%3Awas-backported",
+        )} | ${slackLink(
+          "Should I backport this?",
+          "https://www.notion.so/metabase/Metabase-Branching-Strategy-6eb577d5f61142aa960a626d6bbdfeb3?pvs=4#89f80d6f17714a0198aeb66c0efd1b71",
+        )}_`,
+      },
+    },
+  ];
+
+  const MAX_CHARACTERS_PER_BLOCK = 2800;
+  const chunks = Math.ceil(text.length / MAX_CHARACTERS_PER_BLOCK);
+
+  const lines = text.split("\n");
+  const chunkSize = Math.floor(lines.length / chunks);
+  const chunkedLines = chunk(lines, chunkSize);
+
+  const attachments = [
+    {
+      color: "#F9841A",
+      blocks: chunkedLines.map((lines) => ({
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: lines.join("\n"),
+        },
+      })),
+    },
+  ];
+
+  return slack.chat.postMessage({
+    channel: channelName,
+    blocks,
+    attachments,
+    text: `${backports.length} open backports`,
+  });
+}
+
+export async function sendPreReleaseStatus({
+  channelName,
+  version,
+  date,
+  openIssues,
+  closedIssueCount,
+  milestoneId,
+}: {
+  channelName: string;
+  version: string;
+  date: string;
+  openIssues: Issue[];
+  closedIssueCount: number;
+  milestoneId: number;
+}) {
+  const blockerText = `* ${openIssues.length} Blockers*
+    ${openIssues.map((issue) => `  • <${issue.html_url}|#${issue.number} - ${issue.title}> - ${mentionUserByGithubLogin(issue.assignee?.login)}`).join("\n")}`;
+
+  const blocks = [
+    {
+      type: "header",
+      text: {
+        type: "plain_text",
+        text: `:rocket:  Upcoming ${version} Release Status`,
+        emoji: true,
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `_<https://github.com/metabase/metabase/milestone/${milestoneId}|:direction-sign: Milestone> targeted for release on ${date}_ ${mentionSlackTeam("release-managers")}`,
+      },
+    },
+  ];
+
+  const attachments = [
+    {
+      color: "#32a852",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `*${closedIssueCount} Closed Issues*`,
+          },
+        },
+      ],
+    },
+    {
+      color: "#a83632",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: blockerText,
+          },
+        },
+      ],
+    },
+  ];
+
+  return slack.chat.postMessage({
+    channel: channelName,
+    blocks,
+    attachments,
+    text: `${version} is scheduled for release on ${date}`,
+  });
+}
+
+export function sendSlackMessage({
+  channelName = SLACK_CHANNEL_NAME,
+  message,
+  blocks,
+  attachments,
+}: {
+  channelName?: string;
+  message: string;
+  blocks?: (Block | KnownBlock)[];
+  attachments?: MessageAttachment[];
+}) {
+  return slack.chat.postMessage({
+    channel: channelName,
+    text: message,
+    blocks,
+    attachments,
+  });
+}
+
+async function getSlackChannelId(
+  channelName: string,
+  cursor?: string,
+): Promise<string | undefined> {
+  const response = await slack.conversations.list({
+    cursor,
+    limit: 9999,
+    exclude_archived: true,
+  });
+
+  const maybeChannelId = response.channels?.find(
+    (channel) => channel.name === channelName,
+  )?.id;
+  const nextCursor = response.response_metadata?.next_cursor;
+  if (!maybeChannelId && nextCursor) {
+    return await getSlackChannelId(channelName, nextCursor);
+  }
+
+  return maybeChannelId;
+}
+
+export async function findSlackMessage({
+  channelName,
+  text,
+  limit = 100,
+}: {
+  channelName: string;
+  text: string;
+  limit?: number;
+}) {
+  const channelId = await getSlackChannelId(channelName);
+  if (!channelId) {
+    throw new Error(`Could not find channel ${channelName}`);
+  }
+
+  return findMessageInChannel({ channelId, text, limit });
+}
+
+async function findMessageInChannel({
+  channelId,
+  text,
+  limit = 100,
+}: {
+  channelId: string;
+  text: string;
+  limit?: number;
+}) {
+  const response = await slack.conversations.history({
+    channel: channelId,
+    limit,
+  });
+
+  const existingMessage = response.messages?.find((message) =>
+    message.text?.includes(text),
+  );
+
+  if (!existingMessage) {
+    return null;
+  }
+
+  return {
+    id: existingMessage.ts ?? "",
+    body: existingMessage.text ?? "",
+  };
+}
+
+export async function getRecentSlackMessages({
+  channelName,
+  sinceHours,
+  limit = 100,
+}: {
+  channelName: string;
+  sinceHours?: number;
+  limit?: number;
+}): Promise<string[]> {
+  const channelId = await getSlackChannelId(channelName);
+  if (!channelId) {
+    throw new Error(`Could not find channel ${channelName}`);
+  }
+
+  const oldest =
+    sinceHours === undefined
+      ? undefined
+      : String(Math.floor(Date.now() / 1000) - sinceHours * 3600);
+  const response = await slack.conversations.history({
+    channel: channelId,
+    oldest,
+    limit,
+  });
+
+  return response.messages?.map((message) => message.text ?? "") ?? [];
+}
+
+export async function sendSlackReply({
+  channelName,
+  message,
+  messageId,
+  broadcast,
+}: {
+  channelName: string;
+  message: string;
+  messageId?: string;
+  broadcast?: boolean;
+}) {
+  const channelId = await getSlackChannelId(channelName);
+  if (!channelId) {
+    throw new Error(`Could not find channel ${channelName}`);
+  }
+
+  if (!messageId) {
+    throw new Error("Message ID is not defined");
+  }
+
+  return slack.chat.postMessage({
+    channel: channelId,
+    text: message,
+    thread_ts: messageId, // if this is empty it should post in the channel
+    reply_broadcast: !!broadcast,
+  });
+}
+
+const getReleaseTitle = (version: string) =>
+  `:rocket: *${getGenericVersion(version)} Release* :rocket:`;
+
+export function slackLink(text: string, url: string) {
+  return `<${url}|${text}>`;
+}
+
+export function githubRunLink(
+  text: string,
+  runId: string,
+  owner: string,
+  repo: string,
+) {
+  return slackLink(
+    text,
+    `https://github.com/${owner}/${repo}/actions/runs/${runId}`,
+  );
+}
+
+type JobResults = Record<string, { result?: string } | null>;
+
+export function formatJobResults(needsJson?: string) {
+  if (!needsJson) {
+    return "";
+  }
+
+  let needs: JobResults;
+  try {
+    needs = JSON.parse(needsJson);
+  } catch {
+    return "";
+  }
+
+  if (!needs || typeof needs !== "object") {
+    return "";
+  }
+
+  const jobsWithResult = (result: string) =>
+    Object.entries(needs)
+      .filter(([, job]) => job?.result === result)
+      .map(([name]) => `\`${name}\``);
+
+  return [
+    ["Failed", jobsWithResult("failure")],
+    ["Cancelled", jobsWithResult("cancelled")],
+  ]
+    .filter(([, jobs]) => jobs.length > 0)
+    .map(([label, jobs]) => `${label}: ${(jobs as string[]).join(", ")}`)
+    .join(". ");
+}
+
+export type ReleaseStatus = "failure" | "success";
+
+export async function sendReleaseSlackMessage({
+  channelName,
+  version,
+  emoji,
+  message,
+  startThread = false,
+  status,
+}: {
+  channelName: string;
+  version?: string;
+  emoji?: string;
+  message: string;
+  startThread?: boolean;
+  status?: ReleaseStatus;
+}) {
+  const channelId = await getSlackChannelId(channelName);
+  if (!channelId) {
+    throw new Error(`Could not find channel ${channelName}`);
+  }
+
+  const title = version ? getReleaseTitle(version) : null;
+  const thread =
+    title && !startThread
+      ? await findMessageInChannel({ channelId, text: title }).catch(() => null)
+      : null;
+  const text = emoji ? `:${emoji}: ${message}` : message;
+
+  const response = await slack.chat.postMessage({
+    channel: channelId,
+    text: startThread && title ? `${title}\n${text}` : text,
+    thread_ts: thread?.id,
+  });
+
+  const ts = thread?.id || response.ts || "";
+
+  if (status && ts) {
+    if (status === "success") {
+      await slack.reactions
+        .remove({ channel: channelId, name: "x", timestamp: ts })
+        .catch(() => {});
+    }
+    await slack.reactions
+      .add({
+        channel: channelId,
+        name: status === "success" ? "very-green-check" : "x",
+        timestamp: ts,
+      })
+      .catch(console.warn);
+  }
+
+  return { ts };
+}
+
+export type ReleaseKind = "patch" | "minor";
+
+export type AutoReleaseSkipReason =
+  | "no-next-version"
+  | "no-green-commit"
+  | "already-released";
+
+type AutoReleaseSkipArgs = {
+  kind: ReleaseKind;
+  majorVersion: number;
+  reason: AutoReleaseSkipReason;
+  runId: string;
+  owner: string;
+  repo: string;
+};
+
+export function buildAutoReleaseSkipMessage({
+  kind,
+  majorVersion,
+  reason,
+  runId,
+  owner,
+  repo,
+}: AutoReleaseSkipArgs): string {
+  const runLink = githubRunLink("workflow run", runId, owner, repo);
+  const label = kind === "patch" ? "Auto-patch" : "Auto-minor";
+
+  const noNextVersion =
+    kind === "patch"
+      ? `:x: ${label} for *v${majorVersion}* skipped: could not determine next patch version. ${runLink}`
+      : `:information_source: ${label} for *v${majorVersion}* skipped: no gold release yet — cut it manually. ${runLink}`;
+
+  const alreadyReleasedSuffix =
+    kind === "patch" ? "nothing new to patch" : "nothing new to ship";
+
+  const messageByReason: Record<AutoReleaseSkipReason, string> = {
+    "no-green-commit": `:x: ${label} for *v${majorVersion}* skipped: no commit found suitable for the release. ${runLink}`,
+    "no-next-version": noNextVersion,
+    "already-released": `:information_source: ${label} for *v${majorVersion}* skipped: latest green commit has already been released — ${alreadyReleasedSuffix}. ${mentionSlackTeam("release-managers")} monitor the v${majorVersion} branch and manually release the next green commit. ${runLink}`,
+  };
+
+  return messageByReason[reason];
+}
+
+export async function sendAutoReleaseFailureMessage(
+  args: AutoReleaseSkipArgs & { channelName: string },
+) {
+  return sendReleaseSlackMessage({
+    channelName: args.channelName,
+    message: buildAutoReleaseSkipMessage(args),
+  });
+}
+
+export async function sendPreReleaseMessage({
+  github,
+  owner,
+  repo,
+  version,
+  runId,
+  releaseSha,
+  channelName,
+  userName,
+}: ReleaseProps & {
+  version: string;
+  runId: string;
+  releaseSha: string;
+  channelName: string;
+  userName: string;
+}) {
+  const milestone = await findMilestone({ version, github, owner, repo });
+  console.log("Milestone", milestone);
+  const milestoneLink = milestone?.number
+    ? slackLink(
+        `_:direction-sign: Milestone_`,
+        `https://github.com/${owner}/${repo}/milestone/${milestone.number}?closed=1`,
+      )
+    : "";
+
+  const releaseCommitLink = slackLink(
+    `_:merged: Release Commit_`,
+    `https://github.com/${owner}/${repo}/commit/${releaseSha}`,
+  );
+
+  const githubBuildLink = githubRunLink("_🏗️ CI Build_", runId, owner, repo);
+
+  const message = [
+    releaseCommitLink,
+    milestoneLink,
+    githubBuildLink,
+    userName
+      ? `started from ${owner}/${repo} by ${mentionUserByGithubLogin(userName)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" - ");
+
+  await sendReleaseSlackMessage({
+    channelName,
+    version,
+    message,
+    startThread: true,
+  });
+}
+
+export async function sendTestsCompleteMessage({
+  channelName,
+  version,
+  runId,
+  owner,
+  repo,
+}: {
+  channelName: string;
+  version: string;
+  runId: number;
+  owner: string;
+  repo: string;
+}) {
+  await sendReleaseSlackMessage({
+    channelName,
+    version,
+    emoji: "very-green-check",
+    message: `${getGenericVersion(version)} ${githubRunLink("Pre-release Tests Passed", runId.toString(), owner, repo)}`,
+  });
+}
+
+export async function sendPublishStartMessage({
+  channelName,
+  version,
+  runId,
+  owner,
+  repo,
+}: {
+  channelName: string;
+  version: string;
+  runId: number;
+  owner: string;
+  repo: string;
+}) {
+  await sendReleaseSlackMessage({
+    channelName,
+    version,
+    emoji: "loading",
+    message: githubRunLink(
+      `Publishing ${getGenericVersion(version)}`,
+      runId.toString(),
+      owner,
+      repo,
+    ),
+  });
+}
+
+export async function sendPublishCompleteMessage({
+  channelName,
+  version,
+  runId,
+  owner,
+  repo,
+}: {
+  channelName: string;
+  version: string;
+  runId: number;
+  owner: string;
+  repo: string;
+}) {
+  const baseMessage = `*${githubRunLink(`${getGenericVersion(version)} Release is Complete`, runId.toString(), owner, repo)}* :partydeploy:`;
+
+  const fullMessage = `\n
+    • ${slackLink("Ops Issues", `https://github.com/${owner}/metabase-ops/issues`)} - ${mentionSlackTeam("successengineers")}
+    • ${slackLink("Release Notes", `https://github.com/${owner}/${repo}/releases`)} - ${mentionSlackTeam("tech-writers")}`;
+
+  const isPatch = version.split(".").length > 3;
+
+  await sendReleaseSlackMessage({
+    channelName,
+    version,
+    emoji: "partydeploy",
+    message: `${baseMessage}${isPatch ? "" : fullMessage}`,
+    status: "success",
+  });
+}
+
+export async function sendFlakeStatusReport({
+  channelName,
+  openFlakeInfo,
+  closedFlakeInfo,
+}: {
+  channelName: string;
+  openFlakeInfo: string;
+  closedFlakeInfo: string;
+}) {
+  const blocks = [
+    {
+      type: "header",
+      text: {
+        type: "plain_text",
+        text: `:croissant: Flaky Tests Status :croissant:`,
+        emoji: true,
+      },
+    },
+  ];
+
+  const attachments = [
+    {
+      color: "#46ad1a",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `:muscle: *Recently Closed Flakes*\n ${closedFlakeInfo}`,
+          },
+        },
+      ],
+    },
+    {
+      color: "#d9bb34",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `:clipboard: *Open Flakes*\n ${openFlakeInfo}`,
+          },
+        },
+      ],
+    },
+  ];
+
+  return slack.chat.postMessage({
+    channel: channelName,
+    blocks,
+    attachments,
+    text: `Flaky issue summary`,
+  });
+}
+
+function chunk<T>(array: T[], count: number): T[][] {
+  const result: T[][] = [];
+  let i = 0;
+  while (i < array.length) {
+    result.push(array.slice(i, (i += count)));
+  }
+  return result;
+}

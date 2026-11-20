@@ -1,0 +1,396 @@
+Table "auth"."user_account" {
+  "id" bigint [not null, increment]
+  "email" varchar(320) [not null]
+  "display_name" varchar(256) [not null]
+  "password_hash" text [not null]
+  "role" varchar(16) [not null, default: 'viewer']
+  "status" varchar(16) [not null, default: 'pending']
+  "email_confirmed_at" timestamptz
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+
+  Checks {
+    `email = trim(email) AND length(email) > 0` [name: 'ck_user_account_email']
+    `length(trim(display_name)) > 0` [name: 'ck_user_account_display_name']
+    `length(trim(password_hash)) > 0` [name: 'ck_user_account_password_hash']
+    `role IN ('viewer', 'editor')` [name: 'ck_user_account_role']
+    `status IN ('pending', 'active', 'disabled')` [name: 'ck_user_account_status']
+    `status <> 'active' OR email_confirmed_at IS NOT NULL` [name: 'ck_user_account_confirmation']
+    `updated_at >= created_at AND (email_confirmed_at IS NULL OR email_confirmed_at >= created_at)` [name: 'ck_user_account_times']
+  }
+
+  Indexes {
+    id [pk, name: "pk_user_account"]
+    `lower(email)` [unique, name: "uq_user_account_email"]
+  }
+}
+
+Table "auth"."user_session" {
+  "id" bigint [not null, increment]
+  "user_id" bigint [not null]
+  "token_hash" varchar(64) [not null]
+  "created_at" timestamptz [not null, default: `now()`]
+  "expires_at" timestamptz [not null]
+  "revoked_at" timestamptz
+
+  Checks {
+    `token_hash ~ '^[0-9a-f]{64}$'` [name: 'ck_user_session_hash']
+    `expires_at > created_at AND (revoked_at IS NULL OR revoked_at >= created_at)` [name: 'ck_user_session_times']
+  }
+
+  Indexes {
+    id [pk, name: "pk_user_session"]
+    token_hash [unique, name: "uq_user_session_token"]
+    user_id [name: "ix_user_session_user"]
+  }
+}
+
+Table "auth"."action_token" {
+  "id" bigint [not null, increment]
+  "user_id" bigint [not null]
+  "purpose" varchar(32) [not null]
+  "token_hash" varchar(64) [not null]
+  "created_at" timestamptz [not null, default: `now()`]
+  "expires_at" timestamptz [not null]
+  "used_at" timestamptz
+
+  Checks {
+    `purpose IN ('verify_email', 'reset_password')` [name: 'ck_action_token_purpose']
+    `token_hash ~ '^[0-9a-f]{64}$'` [name: 'ck_action_token_hash']
+    `expires_at > created_at AND (used_at IS NULL OR used_at >= created_at)` [name: 'ck_action_token_times']
+  }
+
+  Indexes {
+    id [pk, name: "pk_action_token"]
+    token_hash [unique, name: "uq_action_token_hash"]
+    user_id [name: "ix_action_token_user"]
+  }
+}
+
+Table "ref"."bucket_set" {
+  "id" bigint [not null, increment]
+  "code" varchar(64) [not null]
+  "version_no" integer [not null]
+  "name" varchar(256) [not null]
+
+  Checks {
+    `version_no > 0` [name: 'ck_bucket_set_version']
+  }
+
+  Indexes {
+    id [pk, name: "pk_bucket_set"]
+    (code, version_no) [unique, name: "uq_bucket_set_version"]
+  }
+}
+
+Table "ref"."time_bucket" {
+  "bucket_set_id" bigint [not null]
+  "bucket_no" smallint [not null]
+  "label" varchar(16) [not null]
+  "lower_years" numeric(12,8) [not null]
+  "upper_years" numeric(12,8)
+  "tenor_years" numeric(12,8) [not null]
+
+  Checks {
+    `bucket_no > 0` [name: 'ck_time_bucket_number']
+    `lower_years >= 0 AND (upper_years IS NULL OR upper_years > lower_years)` [name: 'ck_time_bucket_bounds']
+    `tenor_years > 0 AND tenor_years >= lower_years AND (upper_years IS NULL OR tenor_years <= upper_years)` [name: 'ck_time_bucket_tenor']
+  }
+
+  Indexes {
+    (bucket_set_id, bucket_no) [pk, name: "pk_time_bucket"]
+    (bucket_set_id, label) [unique, name: "uq_time_bucket_label"]
+  }
+}
+
+Table "market"."ingestion_batch" {
+  "id" bigint [not null, increment]
+  "source" varchar(32) [not null]
+  "status" varchar(16) [not null, default: 'running']
+  "started_at" timestamptz [not null, default: `now()`]
+  "finished_at" timestamptz
+  "error_message" text
+
+  Checks {
+    `status IN ('running', 'succeeded', 'failed')` [name: 'ck_ingestion_batch_status']
+    `finished_at IS NULL OR finished_at >= started_at` [name: 'ck_ingestion_batch_times']
+  }
+
+  Indexes {
+    id [pk, name: "pk_ingestion_batch"]
+  }
+}
+
+Table "market"."curve" {
+  "id" bigint [not null, increment]
+  "ingestion_batch_id" bigint [not null]
+  "source" varchar(32) [not null]
+  "curve_code" varchar(32) [not null]
+  "currency_code" varchar(3) [not null, default: 'RUB']
+  "curve_date" date [not null]
+  "revision" integer [not null, default: 1]
+  "status" varchar(16) [not null, default: 'loading']
+  "rate_convention" varchar(64)
+  "payload" jsonb [not null]
+  "payload_sha256" varchar(64) [not null]
+  "loaded_at" timestamptz [not null, default: `now()`]
+
+  Checks {
+    `revision > 0` [name: 'ck_curve_revision']
+    `status IN ('loading', 'accepted', 'rejected')` [name: 'ck_curve_status']
+    `payload_sha256 ~ '^[0-9a-f]{64}$'` [name: 'ck_curve_hash']
+    `currency_code ~ '^[A-Z]{3}$'` [name: 'ck_curve_currency']
+  }
+
+  Indexes {
+    id [pk, name: "pk_curve"]
+    (source, curve_code, currency_code, curve_date, revision) [unique, name: "uq_curve_revision"]
+    (source, curve_code, currency_code, curve_date, payload_sha256) [unique, name: "uq_curve_payload"]
+    ingestion_batch_id [name: "ix_curve_batch"]
+  }
+}
+
+Table "market"."curve_point" {
+  "curve_id" bigint [not null]
+  "point_no" smallint [not null]
+  "tenor_years" numeric(12,8) [not null]
+  "rate_pct" numeric(18,10) [not null]
+
+  Checks {
+    `point_no > 0` [name: 'ck_curve_point_number']
+    `tenor_years > 0` [name: 'ck_curve_point_tenor']
+  }
+
+  Indexes {
+    (curve_id, point_no) [pk, name: "pk_curve_point"]
+    (curve_id, tenor_years) [unique, name: "uq_curve_point_tenor"]
+  }
+}
+
+Table "app"."methodology_version" {
+  "id" bigint [not null, increment]
+  "code" varchar(64) [not null]
+  "version_no" integer [not null]
+  "name" varchar(256) [not null]
+  "status" varchar(16) [not null, default: 'draft']
+  "bucket_set_id" bigint [not null]
+  "x" numeric(12,8)
+  "parallel_shift_pp" numeric(18,10)
+  "short_shift_pp" numeric(18,10)
+  "long_shift_pp" numeric(18,10)
+  "floor_mode" varchar(16)
+  "floor_params" jsonb
+  "interpolation_method" varchar(64)
+  "extrapolation_method" varchar(64)
+  "nearest_method" varchar(64)
+  "rate_convention" varchar(64)
+  "source_document" varchar(512)
+  "created_by" varchar(128) [not null]
+  "created_by_user_id" bigint
+  "created_at" timestamptz [not null, default: `now()`]
+
+  Checks {
+    `version_no > 0` [name: 'ck_methodology_version']
+    `status IN ('draft', 'ready', 'retired')` [name: 'ck_methodology_status']
+    `x > 0` [name: 'ck_methodology_x']
+    `parallel_shift_pp >= 0 AND short_shift_pp >= 0 AND long_shift_pp >= 0` [name: 'ck_methodology_shifts']
+    `floor_mode IN ('none', 'constant', 'by_bucket')` [name: 'ck_methodology_floor_mode']
+    `status = 'draft' OR ((
+        x IS NOT NULL AND parallel_shift_pp IS NOT NULL AND short_shift_pp IS NOT NULL AND long_shift_pp IS NOT NULL
+        AND interpolation_method IS NOT NULL AND extrapolation_method IS NOT NULL AND nearest_method IS NOT NULL
+        AND rate_convention IS NOT NULL AND floor_mode IS NOT NULL
+        AND (
+            (floor_mode = 'none' AND floor_params IS NULL)
+            OR (floor_mode = 'constant' AND jsonb_typeof(floor_params->'value_pct') = 'number')
+            OR (floor_mode = 'by_bucket' AND jsonb_typeof(floor_params) = 'object')
+        )
+        AND length(trim(interpolation_method)) > 0 AND length(trim(extrapolation_method)) > 0
+        AND length(trim(nearest_method)) > 0 AND length(trim(rate_convention)) > 0
+    ) IS TRUE)` [name: 'ck_methodology_ready']
+  }
+
+  Indexes {
+    id [pk, name: "pk_methodology_version"]
+    (code, version_no) [unique, name: "uq_methodology_version"]
+    (id, bucket_set_id) [unique, name: "uq_methodology_bucket_set"]
+    created_by_user_id [name: "ix_methodology_author"]
+  }
+}
+
+Table "app"."scenario" {
+  "id" bigint [not null, increment]
+  "code" varchar(64) [not null]
+  "version_no" integer [not null]
+  "name" varchar(256) [not null]
+  "shift_type" varchar(32) [not null]
+  "params" jsonb
+  "is_predefined" boolean [not null, default: false]
+  "is_active" boolean [not null, default: true]
+  "created_by" varchar(128) [not null]
+  "created_by_user_id" bigint
+  "created_at" timestamptz [not null, default: `now()`]
+
+  Checks {
+    `version_no > 0` [name: 'ck_scenario_version']
+    `shift_type IN ('base', 'parallel_up', 'parallel_down', 'steepener', 'flattener', 'short_up', 'short_down', 'custom_by_bucket')` [name: 'ck_scenario_shift_type']
+    `params IS NULL OR jsonb_typeof(params) = 'object'` [name: 'ck_scenario_params']
+    `shift_type <> 'custom_by_bucket' OR params IS NOT NULL` [name: 'ck_scenario_custom']
+  }
+
+  Indexes {
+    id [pk, name: "pk_scenario"]
+    (code, version_no) [unique, name: "uq_scenario_version"]
+    `(CASE WHEN is_active THEN code END)` [unique, name: "uq_scenario_active"]
+    created_by_user_id [name: "ix_scenario_author"]
+  }
+}
+
+Table "audit"."audit_log" {
+  "id" bigint [not null, increment]
+  "occurred_at" timestamptz [not null, default: `now()`]
+  "actor" varchar(128) [not null]
+  "actor_user_id" bigint
+  "action" varchar(64) [not null]
+  "entity_type" varchar(64) [not null]
+  "entity_id" bigint [not null]
+  "details" jsonb
+
+  Indexes {
+    id [pk, name: "pk_audit_log"]
+    (entity_type, entity_id) [name: "ix_audit_log_entity"]
+    actor_user_id [name: "ix_audit_actor"]
+  }
+}
+
+Table "calc"."curve_run" {
+  "id" bigint [not null, increment]
+  "curve_id" bigint [not null]
+  "methodology_id" bigint [not null]
+  "bucket_set_id" bigint [not null]
+  "status" varchar(16) [not null, default: 'pending']
+  "reporting_date" date [not null]
+  "created_by" varchar(128) [not null]
+  "created_by_user_id" bigint
+  "created_at" timestamptz [not null, default: `now()`]
+  "attempt" integer [not null, default: 0]
+  "claimed_by" varchar(128)
+  "heartbeat_at" timestamptz
+  "started_at" timestamptz
+  "finished_at" timestamptz
+  "error_message" text
+  "engine_version" varchar(64)
+
+  Checks {
+    `status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')` [name: 'ck_curve_run_status']
+    `attempt >= 0` [name: 'ck_curve_run_attempt']
+    `finished_at IS NULL OR (started_at IS NOT NULL AND finished_at >= started_at)` [name: 'ck_curve_run_times']
+  }
+
+  Indexes {
+    id [pk, name: "pk_curve_run"]
+    (id, curve_id, bucket_set_id) [unique, name: "uq_curve_run_source"]
+    (id, bucket_set_id) [unique, name: "uq_curve_run_bucket_set"]
+    (status, created_at) [name: "ix_curve_run_queue"]
+    curve_id [name: "ix_curve_run_curve"]
+    (methodology_id, bucket_set_id) [name: "ix_curve_run_methodology"]
+    created_by_user_id [name: "ix_curve_run_author"]
+  }
+}
+
+Table "calc"."run_scenario" {
+  "curve_run_id" bigint [not null]
+  "scenario_id" bigint [not null]
+
+  Indexes {
+    (curve_run_id, scenario_id) [pk, name: "pk_run_scenario"]
+    scenario_id [name: "ix_run_scenario_scenario"]
+  }
+}
+
+Table "calc"."base_curve_point" {
+  "curve_run_id" bigint [not null]
+  "curve_id" bigint [not null]
+  "bucket_set_id" bigint [not null]
+  "bucket_no" smallint [not null]
+  "rate_pct" numeric(18,10) [not null]
+  "value_source" varchar(16) [not null]
+  "exp_factor" numeric(18,12) [not null]
+  "one_minus_exp_factor" numeric(18,12) [not null]
+  "floor_pct" numeric(18,10)
+
+  Checks {
+    `value_source IN ('known', 'nearest', 'interpolated', 'extrapolated')` [name: 'ck_base_curve_point_source']
+    `exp_factor BETWEEN 0 AND 1 AND one_minus_exp_factor BETWEEN 0 AND 1 AND abs(exp_factor + one_minus_exp_factor - 1) <= 0.000000000001` [name: 'ck_base_curve_point_factors']
+  }
+
+  Indexes {
+    (curve_run_id, bucket_no) [pk, name: "pk_base_curve_point"]
+    (curve_run_id, bucket_no, curve_id) [unique, name: "uq_base_curve_point_source"]
+    (curve_run_id, bucket_set_id, bucket_no) [unique, name: "uq_base_curve_point_bucket"]
+  }
+}
+
+Table "calc"."base_point_source" {
+  "curve_run_id" bigint [not null]
+  "bucket_no" smallint [not null]
+  "curve_id" bigint [not null]
+  "point_no" smallint [not null]
+  "weight" numeric(18,12)
+
+  Indexes {
+    (curve_run_id, bucket_no, point_no) [pk, name: "pk_base_point_source"]
+  }
+}
+
+Table "calc"."stressed_curve_point" {
+  "curve_run_id" bigint [not null]
+  "scenario_id" bigint [not null]
+  "bucket_no" smallint [not null]
+  "shift_pp" numeric(18,10) [not null]
+  "rate_before_floor_pct" numeric(18,10) [not null]
+  "rate_pct" numeric(18,10) [not null]
+
+  Indexes {
+    (curve_run_id, scenario_id, bucket_no) [pk, name: "pk_stressed_curve_point"]
+  }
+}
+
+Ref "fk_user_session_user":"auth"."user_account"."id" < "auth"."user_session"."user_id"
+
+Ref "fk_action_token_user":"auth"."user_account"."id" < "auth"."action_token"."user_id"
+
+Ref "fk_time_bucket_set":"ref"."bucket_set"."id" < "ref"."time_bucket"."bucket_set_id"
+
+Ref "fk_curve_batch":"market"."ingestion_batch"."id" < "market"."curve"."ingestion_batch_id"
+
+Ref "fk_curve_point_curve":"market"."curve"."id" < "market"."curve_point"."curve_id"
+
+Ref "fk_methodology_author":"auth"."user_account"."id" < "app"."methodology_version"."created_by_user_id"
+
+Ref "fk_methodology_bucket_set":"ref"."bucket_set"."id" < "app"."methodology_version"."bucket_set_id"
+
+Ref "fk_scenario_author":"auth"."user_account"."id" < "app"."scenario"."created_by_user_id"
+
+Ref "fk_audit_actor":"auth"."user_account"."id" < "audit"."audit_log"."actor_user_id"
+
+Ref "fk_curve_run_author":"auth"."user_account"."id" < "calc"."curve_run"."created_by_user_id"
+
+Ref "fk_curve_run_curve":"market"."curve"."id" < "calc"."curve_run"."curve_id"
+
+Ref "fk_curve_run_methodology":"app"."methodology_version".("id", "bucket_set_id") < "calc"."curve_run".("methodology_id", "bucket_set_id")
+
+Ref "fk_run_scenario_run":"calc"."curve_run"."id" < "calc"."run_scenario"."curve_run_id"
+
+Ref "fk_run_scenario_scenario":"app"."scenario"."id" < "calc"."run_scenario"."scenario_id"
+
+Ref "fk_base_curve_point_run":"calc"."curve_run".("id", "curve_id", "bucket_set_id") < "calc"."base_curve_point".("curve_run_id", "curve_id", "bucket_set_id")
+
+Ref "fk_base_curve_point_bucket":"ref"."time_bucket".("bucket_set_id", "bucket_no") < "calc"."base_curve_point".("bucket_set_id", "bucket_no")
+
+Ref "fk_base_point_source_base":"calc"."base_curve_point".("curve_run_id", "bucket_no", "curve_id") < "calc"."base_point_source".("curve_run_id", "bucket_no", "curve_id")
+
+Ref "fk_base_point_source_market":"market"."curve_point".("curve_id", "point_no") < "calc"."base_point_source".("curve_id", "point_no")
+
+Ref "fk_stressed_curve_point_scenario":"calc"."run_scenario".("curve_run_id", "scenario_id") < "calc"."stressed_curve_point".("curve_run_id", "scenario_id")
+
+Ref "fk_stressed_curve_point_base":"calc"."base_curve_point".("curve_run_id", "bucket_no") < "calc"."stressed_curve_point".("curve_run_id", "bucket_no")

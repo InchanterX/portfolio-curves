@@ -1,0 +1,96 @@
+import { useMemo } from "react";
+import { t } from "ttag";
+import * as Yup from "yup";
+
+import { FormModelPicker } from "metabase/actions/containers/ActionCreator/FormModelPicker";
+import type { CreateQueryActionParams } from "metabase/actions/types";
+import {
+  Form,
+  FormErrorMessage,
+  FormProvider,
+  FormSubmitButton,
+  FormTextInput,
+  FormTextarea,
+} from "metabase/forms";
+import { Button, Modal, Stack } from "metabase/ui";
+import * as Errors from "metabase/utils/errors";
+
+const ACTION_SCHEMA = Yup.object({
+  name: Yup.string()
+    .required(Errors.required)
+    .max(100, Errors.maxLength)
+    .default(""),
+  description: Yup.string().nullable().max(255, Errors.maxLength).default(null),
+  model_id: Yup.number().required(Errors.required),
+});
+
+export type FormValues = Pick<
+  CreateQueryActionParams,
+  "name" | "description" | "model_id"
+>;
+
+interface OwnProps {
+  initialValues?: Partial<FormValues>;
+  onCreate: (values: FormValues) => void;
+  onCancel?: () => void;
+}
+
+type CreateActionFormProps = OwnProps;
+
+function CreateActionForm({
+  initialValues: initialValuesProp,
+  onCreate,
+  onCancel,
+}: CreateActionFormProps) {
+  const initialValues = useMemo(
+    () => ({
+      ...ACTION_SCHEMA.getDefault(),
+      ...initialValuesProp,
+    }),
+    [initialValuesProp],
+  );
+
+  return (
+    <FormProvider
+      // Unjustified type cast. FIXME
+      initialValues={initialValues as FormValues}
+      validationSchema={ACTION_SCHEMA}
+      onSubmit={onCreate}
+    >
+      {({ isValid }) => (
+        <Form disabled={!isValid} data-testid="create-action-form">
+          <Stack gap="xl">
+            <FormTextInput
+              name="name"
+              label={t`Name`}
+              placeholder={t`My new fantastic action`}
+              data-autofocus
+            />
+            <FormTextarea
+              name="description"
+              label={t`Description`}
+              placeholder={t`It's optional but oh, so helpful`}
+              minRows={5}
+              nullable
+            />
+            <FormModelPicker name="model_id" title={t`Model it's saved in`} />
+          </Stack>
+          <Modal.Footer>
+            <FormErrorMessage flex={1} />
+            {!!onCancel && (
+              <Button type="button" onClick={onCancel}>{t`Cancel`}</Button>
+            )}
+            <FormSubmitButton
+              label={t`Create`}
+              disabled={!isValid}
+              variant="filled"
+            />
+          </Modal.Footer>
+        </Form>
+      )}
+    </FormProvider>
+  );
+}
+
+// eslint-disable-next-line import/no-default-export -- deprecated usage
+export default CreateActionForm;

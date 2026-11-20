@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# This script merges translations from the given branch into the current branch.
+#
+# It's useful to run this after backporting a translation PR, since that PR may
+# remove translations from the release branch that are still needed on that
+# branch. With this script, you can restore these translations by merging the
+# translations from the release branch into the backport branch.
+#
+# In case of a conflict, the translation in the current branch is used. To give
+# precedence to translations in the other branch, use the -o flag.
+#
+# Example usage:
+#   ./bin/i18n/merge-translations <branch-name> [-o]
+#
+# The script reads the catalogs pinned in locales/translations.pin on both
+# branches, publishes the merged catalogs, and updates the pin on this branch.
+
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+cd "$I18N_ROOT"
+
+other_branch="${1:?Usage: merge-translations <branch> [-o]}"
+prioritize_other=false
+case "${2:-}" in
+  -o) prioritize_other=true ;;
+  "") ;;
+  *) echo "Usage: $0 <branch> [-o]" >&2; exit 1 ;;
+esac
+git rev-parse --verify "$other_branch^{commit}" > /dev/null
+
+checkout=$(./bin/i18n/prepare-translation-update)
+trap 'if [ "$?" = 0 ]; then rm -rf "$checkout"; else echo "Update retained at $checkout" >&2; fi' EXIT
+source_directory="$checkout/locales"
+
+if other_pin=$(git show "$other_branch:locales/translations.pin" 2>/dev/null); then
+  other_directory="$checkout/other"
+  i18n_download "$(i18n_pin "$other_pin")" "$other_directory"
+else
+  other_directory="$checkout/legacy"
+  mkdir "$other_directory"
+  git archive "$other_branch:locales" -- '*.po' | tar -x -C "$other_directory"
+fi
+
+for other_po in "$other_directory/"*.po; do
+  po="$source_directory/$(basename "$other_po")"
+  if [ ! -f "$po" ]; then
+    cp "$other_po" "$po"
+    chmod u+w "$po"
+  elif [ "$prioritize_other" = true ]; then
+    msgcat --no-wrap --use-first "$other_po" "$po" > "$po.tmp"
+    mv "$po.tmp" "$po"
+  else
+    msgcat --no-wrap --use-first "$po" "$other_po" > "$po.tmp"
+    mv "$po.tmp" "$po"
+  fi
+done
+
+./bin/i18n/build-translation-resources "$source_directory"
+./bin/i18n/publish-translations "$checkout"

@@ -1,0 +1,56 @@
+import type {
+  BrowserEmbedOptions,
+  DataAppEmbedOptions,
+  ExplorationEmbedOptions,
+  MetabotEmbedOptions,
+  SdkIframeDashboardEmbedSettings,
+  SdkIframeEmbedAuthTypeSettings,
+  SdkIframeEmbedBaseSettings,
+  SdkIframeQuestionEmbedSettings,
+} from "metabase/embedding/embedding-iframe-sdk/types/embed";
+import type {
+  BaseRecentItem,
+  SdkIframeEmbedSetupTheme,
+} from "metabase-types/api";
+
+export type { SdkIframeEmbedSetupTheme } from "metabase-types/api";
+
+export type SdkIframeEmbedSetupStep =
+  | "select-embed-experience"
+  | "select-embed-options"
+  | "get-code";
+
+export type SdkIframeEmbedSetupRecentItemType =
+  | "dashboard"
+  | "question"
+  | "collection";
+
+export type SdkIframeEmbedSetupRecentItem = Pick<
+  BaseRecentItem,
+  "name" | "description"
+> & { id: string | number };
+
+export type SdkIframeEmbedSetupGuestEmbedSettings =
+  SdkIframeEmbedAuthTypeSettings;
+
+export type SdkIframeEmbedSetupTemplateSettings =
+  | SdkIframeDashboardEmbedSettings
+  | SdkIframeQuestionEmbedSettings
+  | ExplorationEmbedOptions
+  | BrowserEmbedOptions
+  | MetabotEmbedOptions
+  // Data apps does not support theme overrides.
+  // Keep the wizard's saved theme when switching experiences only.
+  | Omit<DataAppEmbedOptions, "theme">;
+
+/**
+ * Settings used by the embed setup route.
+ * Excludes `instanceUrl` as it is derived dynamically from site-url.
+ */
+export type SdkIframeEmbedSetupSettings = Omit<
+  SdkIframeEmbedBaseSettings,
+  "instanceUrl" | "theme"
+> & {
+  theme?: SdkIframeEmbedSetupTheme;
+} & Partial<SdkIframeEmbedSetupGuestEmbedSettings> &
+  SdkIframeEmbedSetupTemplateSettings;

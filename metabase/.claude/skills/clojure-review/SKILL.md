@@ -1,0 +1,192 @@
+---
+name: clojure-review
+description: Review Clojure and ClojureScript code changes for compliance with Metabase coding standards, style violations, and code quality issues. Use when reviewing pull requests or diffs containing Clojure/ClojureScript code.
+allowed-tools: Read, Grep, Bash, Glob
+metadata:
+  metareview:
+    title: Clojure review
+    kind: agent
+    rule: Clojure files changed
+    watches: ["*.clj", "*.cljc", "*.cljs"]
+    icon: lambda
+    color: green
+---
+
+# Clojure Code Review Skill
+
+@./../_shared/clojure-style-guide.md
+@./../_shared/clojure-commands.md
+
+## Review guidelines
+
+**What to flag:**
+
+- Check compliance with the Metabase Clojure style guide (included above)
+- If `CLOJURE_STYLE_GUIDE.adoc` exists in the working directory, also check compliance with the community Clojure style guide
+- Flag all style guide violations
+
+**What NOT to post:**
+
+- Do not post comments congratulating someone for trivial changes or for following style guidelines
+- Do not post comments confirming things "look good" or telling them they did something correctly
+- Only post comments about style violations or potential issues
+
+Example bad code review comments to avoid:
+
+> This TODO comment is properly formatted with author and date - nice work!
+
+> Good addition of limit 1 to the query - this makes the test more efficient without changing its behavior.
+
+> The kondo ignore comment is appropriately placed here
+
+> Test name properly ends with -test as required by the style guide.
+
+**Special cases:**
+
+- Do not post comments about missing parentheses (these will be caught by the linter)
+
+## Quick review checklist
+
+Use this to scan through changes efficiently:
+
+### Naming
+
+- [ ] Descriptive names (no `tbl`, `zs'`)
+- [ ] Pure functions named as nouns describing their return value
+- [ ] `kebab-case` for all variables and functions
+- [ ] Functions that mutate shared global state (not thread-safe) end with `!`, and no others: a function that only
+      validates and throws has no `!`
+- [ ] No namespace-alias repetition in function names
+- [ ] No `inner-query`, `outer-query` or `pmbql` in names in code that works with MBQL 5: use `stage`, `query` and
+      `mbql5`
+
+### Documentation
+
+- [ ] Public vars in `src` or `enterprise/backend/src` have useful docstrings
+- [ ] Docstrings use Markdown conventions
+- [ ] References use `[[other-var]]` not backticks
+- [ ] `TODO` comments include author and date: `;; TODO (Name 2025-01-01) -- description`
+
+Docstring content — check every new or rewritten docstring against the anti-pattern table in the
+style guide above. Read the diff's docstrings on their own, separately from the code: prose is
+where review attention slides off, and a long docstring reads as diligence rather than as the
+liability it usually is.
+
+### Code Organization
+
+- [ ] Everything `^:private` unless used elsewhere
+- [ ] No `declare` when avoidable (public functions near end)
+- [ ] Functions under 20 lines when possible
+- [ ] No blank, non-comment lines within definition forms (except pairwise constructs in `let`/`cond`)
+- [ ] Lines ≤ 120 characters
+
+### Tests
+
+- [ ] Separate `deftest` forms for distinct test cases
+- [ ] Pure tests marked `^:parallel`
+- [ ] Test names end in `-test` or `-test-<number>`
+- [ ] Test queries, fixtures included, built with `lib/` (`lib/query`, `lib/native-query`), never hand-written maps
+      (except a deliberately non-MBQL-5 query in a test that checks it is refused or converted)
+- [ ] New tests do not use `mt/mbql-query`, `mt/query`, `mt/native-query` or `mt/run-mbql-query`
+- [ ] New tests that need no real app DB objects use `meta/metadata-provider` and `lib.tu/mock-metadata-provider`, not
+      `(mt/metadata-provider)` and `mt/with-temp`
+
+### Modules
+
+- [ ] Correct module patterns (OSS: `metabase.<module>.*`, EE: `metabase-enterprise.<module>.*`)
+- [ ] API endpoints in `<module>.api` namespaces
+- [ ] Public API in `<module>.core` with Potemkin
+- [ ] No cheating module linters with `:clj-kondo/ignore [:metabase/modules]`
+
+### Models
+
+See the `backend-model-rules` skill.
+
+- [ ] A rule every writer must obey is in a hook, so a writer that calls no endpoint still obeys it
+- [ ] Hooks read no current user and do not depend on who the writer is
+- [ ] Derived columns are computed in hooks and absent from request schemas
+- [ ] Per-user rules are in `:can_read` / `:can_write` hydrations, `mi/can-create?` or `mi/can-update?`
+- [ ] Uniqueness rules have a unique index
+
+### REST API
+
+- [ ] Response schemas present (`:- <schema>`)
+- [ ] Query params use kebab-case, bodies use `snake_case`
+- [ ] Routes use singular nouns (e.g., `/api/dashboard/:id`)
+- [ ] `GET` has no side effects (except analytics)
+- [ ] Malli schemas detailed and complete
+- [ ] All new endpoints have tests
+
+### MBQL
+
+- [ ] No raw MBQL manipulation outside `lib`, `lib-be`, or `query-processor` modules
+- [ ] Uses Lib and MBQL 5, not legacy MBQL
+- [ ] No new call to `lib/->legacy-MBQL`, in source or tests: it is about to be removed
+
+### Database
+
+- [ ] Model and table names are singular nouns
+- [ ] Uses `t2/select-one-fn` instead of selecting full rows for one column
+- [ ] Logic in Toucan methods, not helper functions
+
+### Drivers
+
+- [ ] New multimethods documented in `docs/developers-guide/driver-changelog.md`
+- [ ] Passes `driver` argument to other driver methods (no hardcoded driver names)
+- [ ] Minimal logic in `read-column-thunk`
+
+### Miscellaneous
+
+- [ ] Example data is bird-themed when possible
+- [ ] Kondo linter suppressions use proper format (not `#_:clj-kondo/ignore` keyword form)
+
+## Pattern matching table
+
+Quick scan for common issues:
+
+| Pattern                                      | Issue                                                       |
+| -------------------------------------------- | ----------------------------------------------------------- |
+| `calculate-age`, `get-user`                  | Pure functions should be nouns: `age`, `user`               |
+| `update-db`, `save-model`                    | Missing `!` for a mutation of shared state: `update-db!`, `save-model!` |
+| `check-input!`, `throw-unsupported!`         | Throwing is not a side effect; drop the `!`: `check-input`, `throw-unsupported` |
+| `snake_case_var`                             | Should use kebab-case                                       |
+| `(into {} (map f xs))`                       | Lazy seq where a transducer would do: `(into {} (map f) xs)`; same for `filter`, `keep`, `map-indexed`, `remove`, `distinct` |
+| Public var without docstring                 | Add docstring explaining purpose                            |
+| `;; TODO fix this`                           | Missing author/date: `;; TODO (Name 2025-01-01) -- description` |
+| `(defn foo ...)` in namespace used elsewhere | Should be `(defn ^:private foo ...)`                        |
+| Function > 20 lines                          | Consider breaking up into smaller functions                 |
+| `/api/dashboards/:id`                        | Use singular: `/api/dashboard/:id`                          |
+| Query params with `snake_case`               | Use kebab-case for query params                             |
+| New API endpoint without tests               | Add tests for the endpoint                                  |
+| `(mt/mbql-query ...)` in a new test          | Build the query with `lib/query` and a metadata provider    |
+| `lib/->legacy-MBQL`                          | About to be removed; keep the query in MBQL 5               |
+| `inner-query`, `outer-query`, `pmbql` names  | Legacy or outdated terms in MBQL 5 code: `stage`, `query`, `mbql5` |
+
+## Feedback format examples
+
+**For style violations:**
+
+> This pure function should be named as a noun describing its return value. Consider `user` instead of `get-user`.
+
+**For missing documentation:**
+
+> This public var needs a docstring explaining its purpose, inputs, and outputs.
+
+**For docstrings documenting code they don't own:**
+
+> This describes how `lib` decides binning strategies internally. Nothing here fails when that
+> changes, so it will go stale silently — drop it and let `available-binning-strategies` answer
+> for its own behavior.
+
+**For docstring content that belongs in the body:**
+
+> This paragraph explains why the branches are ordered this way, which is what someone editing
+> the `cond` needs — but a caller can't act on it. Move it to an inline comment above the `cond`.
+
+**For organization issues:**
+
+> This function is only used in this namespace, so it should be marked `^:private`.
+
+**For API conventions:**
+
+> Query parameters should use kebab-case. Change `user_id` to `user-id`.
