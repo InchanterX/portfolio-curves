@@ -51,7 +51,9 @@ jobs:
 
   integration:
     needs: detect
-    if: contains(needs.detect.outputs.matrix, '"name": "migrations"') || contains(needs.detect.outputs.matrix, '"name": "collector-job"')
+    if: >-
+      contains(fromJSON(needs.detect.outputs.matrix).include.*.name, 'migrations') ||
+      contains(fromJSON(needs.detect.outputs.matrix).include.*.name, 'collector-job')
     runs-on: ubuntu-24.04
     services:
       postgres:
