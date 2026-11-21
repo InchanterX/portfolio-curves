@@ -42,7 +42,8 @@ FUNCTIONS = [
 def upgrade() -> None:
     """Install input guards, calculation invariants and read-only reporting views."""
     sql = Path(__file__).with_suffix(".sql").read_text(encoding="utf-8")
-    op.get_bind().exec_driver_sql(sql)
+    # PostgreSQL format() uses %I/%s inside function bodies, not DBAPI parameters.
+    op.get_bind().exec_driver_sql(sql, execution_options={"no_parameters": True})
 
 
 def downgrade() -> None:
