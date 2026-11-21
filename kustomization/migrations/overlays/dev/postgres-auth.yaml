@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: postgres-auth
+  namespace: curves-migrations-dev
+spec:
+  encryptedData:
+    POSTGRES_PASSWORD: AgCqF6ASaWcHo1qdZTZ9DisJbwfJpecXSCvSBXD/IfNncSrpgCmwfR7tJne1V9TtKoFvml4Ebchj362TkWh3aCGj8Gw1f2cMZQa3A/DBkmb6NdnpX9mBHi4AsjgnA+86gT0SbnaEW0EXPzf/Vga4/tQQS14LzTS7FyFHkYZsp6J65wFUZb5RN7Fz5ty5cV/U5JDn9+L1atQ7CaBErJ9yUukgqIpEYFuxJvbNtOCs6tiTKOMh4OrAxC4jBt6lwIkELgwA0rPCYZqAiJaw2Mq1ueQ19qnsZ99BYJmqpacbzelhkZUEFupC/8ZrMrt6/Id3pQ0I9QjxNwobLs5cTh2yaiGSnF/caQJQAIX8ba+tfo0ADL5mVU9OY6YcbjxlVj/IO4Z19FQLV06GgM7herdq1TP5BbL820TzIlm13DEzEGSrSn/tPef9fhoVk+WlQ3hvl9oKd3fG8RqVwXKqfpJuMNBeUruZ4ZBMJu4K+1qOig8O8Q9KhuZsoehKage4DSvtr5cLR9iwm0jqy2G5/y+7c8/sijUyAOMlYIyFPTc7+NCTD02b8UudNDYD97zRNPs/oqj/VPMNDhZ7Wk1YkDeIJ0ugq23bua4mbJo6GKqh5fT6U6P50R7l6wvYyr9kuz1MBsvjNCeeoVHxu02WdqTk0sDtF2i8sDZIuA2Fx01iVfs2beW8fWpe6DeAweSpaXqusBszCW1RDN14R8dRtciFYedk
+  template:
+    metadata:
+      name: postgres-auth
+      namespace: curves-migrations-dev

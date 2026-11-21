@@ -1,0 +1,13 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: postgres-auth
+  namespace: curves-postgres-dev
+spec:
+  encryptedData:
+    POSTGRES_PASSWORD: AgBnmzJZcHNczCwhjtYuLHe4NY4TZG9PcaXh56b+4oU16UMS6Jf03/XjLif+gXnOFd/CQvkLWIFspX+p/jvGv9v+dlO7+Y7XBOqtwd8+YxRZCBFT4L72+9MMQu7IyfHmG4NPyBM62WGK3sLFy7EfyODgeM/FCo8vtk95+0zg49xiJzO57wetTSMmZMJibzmfm16GOG18d7MC7JSkHRMeTBdw/eSn2CEeEgVVbYphPLaA8zxYP2o5upldi8y2PDUYmLArYUMVXnPjAm8GmDszyqPPSVm8QoBwf7RYOw2pxPqZp6M2ULEZEs7cuLWbLlNGX3F0SmKpXO1BFbXryL2VpXecHO/iCF6OiaCRqMtwd6fAGFZtDQjD7RukkpF7Tjx7L95GLhIo0o0ijwWCpRb561Ec3YLWZCnuuYL5g0tM1fcIeHOhKKPn6XbBQb//wlhyJOMofw59NQCIvImj7b1HvyGpUIc1F5K5YTW7xlVaCmh8zgu0aLscXwBL5n64mLf7UwHUJ8ZGyWPrGooLhRoD/tjfYW2JY2tz05p+WAjrKpFfzLnh8LmbuB460sFU04iBG4YwWerdBfPxYhaVaITCi8vL39RTTN0IOQxlN1xFan2RI8DkjxHvkdPTSfqwPFasrVJexBuWG5JOFxs9/lWdegQrNYrHdOXfTjsuH1w2nGas8kU/7qGwK1i0xIoTTj9q+7hqLfwSOZ5L/IgP0TrWd5bt
+  template:
+    metadata:
+      name: postgres-auth
+      namespace: curves-postgres-dev
