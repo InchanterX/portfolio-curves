@@ -28,7 +28,7 @@ def schema_sources() -> tuple[str, str]:
             flags=re.M,
         )
     for _table, column in re.findall(
-        r"ALTER TABLE ([\w.]+) DROP COLUMN (\w+);", removals
+        r"ALTER\s+TABLE\s+([\w.]+)\s+DROP\s+COLUMN\s+(\w+);", removals
     ):
         # Column names are shared by authorship fields; all are explicitly removed.
         sql = re.sub(rf"^    {column} .*\n", "", sql, flags=re.M)
