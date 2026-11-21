@@ -1,0 +1,43 @@
+name: Promote dev images to prod
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: gitops-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Copy dev tags to prod
+        run: |
+          git fetch origin main
+          git checkout --detach origin/main
+          for component in migrations collector-job metabase; do
+            context="$component"
+            [[ "$component" != collector-job ]] || context=collector_job
+            [[ -f "$context/Dockerfile" ]] || continue
+            dev="kustomization/$component/overlays/dev/kustomization.yaml"
+            prod="kustomization/$component/overlays/prod/kustomization.yaml"
+            tag=$(sed -n -E 's/^[[:space:]]*newTag:[[:space:]]*(sha-[0-9a-f]{40})[[:space:]]*$/\1/p' "$dev")
+            [[ "$tag" =~ ^sha-[0-9a-f]{40}$ ]] || {
+              echo "Publish $component to dev before promoting it." >&2
+              exit 1
+            }
+            sed -i -E "s/^([[:space:]]*newTag:).*/\1 $tag/" "$prod"
+            sed -i '/^[[:space:]]*digest:/d' "$prod"
+            git add -- "$prod"
+          done
+          git diff --cached --quiet && exit 0
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m 'chore(gitops): promote dev image tags to prod'
+          git push origin HEAD:main
