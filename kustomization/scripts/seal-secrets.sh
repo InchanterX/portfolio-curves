@@ -88,7 +88,7 @@ for app in postgres migrations collector-job metabase; do
     filename=$(basename -- "$sealed")
     mv -- "$sealed" "$destination/$filename"
     awk -v entry="$filename" '
-      { lines[NR] = $0; if ($0 ~ "^[[:space:]]*-[[:space:]]+" entry "[[:space:]]*$") found = 1 }
+      { sub(/\r$/, ""); lines[NR] = $0; if ($0 ~ "^[[:space:]]*-[[:space:]]+" entry "[[:space:]]*$") found = 1 }
       END { for (i=1; i<=NR; i++) { print lines[i]; if (!found && lines[i] ~ /^resources:[[:space:]]*$/) print "- " entry } }
     ' "$destination/kustomization.yaml" > "$temporary/kustomization.yaml"
     mv -- "$temporary/kustomization.yaml" "$destination/kustomization.yaml"

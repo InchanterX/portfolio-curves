@@ -13,7 +13,8 @@ BASH = str(GIT_BASH) if GIT_BASH.is_file() else shutil.which("bash")
 
 
 @pytest.mark.skipif(not BASH, reason="Bash is required")
-def test_secret_preparation_is_repeatable_and_failure_safe(tmp_path):
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_secret_preparation_is_repeatable_and_failure_safe(tmp_path, newline):
     """Keep keys stable, avoid credential output, and publish only after encryption."""
     script = tmp_path / "kustomization/scripts/seal-secrets.sh"
     script.parent.mkdir(parents=True)
@@ -21,7 +22,9 @@ def test_secret_preparation_is_repeatable_and_failure_safe(tmp_path):
     for app in ("postgres", "migrations", "collector-job", "metabase"):
         overlay = tmp_path / f"kustomization/{app}/overlays/dev"
         overlay.mkdir(parents=True)
-        (overlay / "kustomization.yaml").write_text("resources:\n- ../../base\n")
+        (overlay / "kustomization.yaml").write_bytes(
+            ("resources:" + newline + "- ../../base" + newline).encode()
+        )
     tools = tmp_path / "bin"
     tools.mkdir()
     stubs = {
@@ -69,6 +72,17 @@ def test_secret_preparation_is_repeatable_and_failure_safe(tmp_path):
 
     result = run("--initialize-key")
     assert result.returncode == 0, result.stderr.decode()
+    for app, required in {
+        "postgres": ["postgres-auth.yaml", "postgres-bootstrap.yaml"],
+        "migrations": ["postgres-auth.yaml", "harbor-pull-secret.yaml"],
+        "collector-job": ["postgres-auth.yaml", "harbor-pull-secret.yaml"],
+        "metabase": ["metabase-auth.yaml", "harbor-pull-secret.yaml"],
+    }.items():
+        lines = (
+            tmp_path / f"kustomization/{app}/overlays/dev/kustomization.yaml"
+        ).read_text().splitlines()
+        for name in required:
+            assert lines.count("- " + name) == 1
     for secret in passwords + [key, "harbor-secret"]:
         assert secret.encode() not in result.stdout + result.stderr
     initial = manifests()
