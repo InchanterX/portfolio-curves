@@ -84,7 +84,9 @@ jobs:
           file: ${{ matrix.context }}/Dockerfile
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ matrix.image }}:sha-${{ github.sha }}
+          tags: |
+            ${{ matrix.image }}:sha-${{ github.sha }}
+            ${{ matrix.image }}:latest
           build-args: |
             MB_EDITION=oss
             VERSION="v0.65.0-curves.${{ github.sha }}"
