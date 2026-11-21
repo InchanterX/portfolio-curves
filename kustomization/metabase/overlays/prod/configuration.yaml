@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metabase
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        env:
+        - name: MB_DB_HOST
+          value: postgres.curves-postgres-prod.svc.cluster.local
+        - name: MB_SITE_URL
+          value: https://curves-prod.faberge-eggs.ru

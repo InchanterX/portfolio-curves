@@ -35,7 +35,7 @@ spec:
                 memory: 512Mi
             env:
             - name: PG_USER
-              value: curves
+              value: curves_collector
             - name: PG_HOST
               value: postgres
             - name: PG_PORT
@@ -50,3 +50,4 @@ spec:
             - name: DATABASE_DSN
               value: postgresql://$(PG_USER):$(POSTGRES_PASSWORD)@$(PG_HOST):$(PG_PORT)/$(PG_DB)
           restartPolicy: Never
+  suspend: true

@@ -1,5 +1,5 @@
 import logging
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from sqlalchemy.exc import OperationalError
@@ -106,3 +106,44 @@ def test_successful_lock():
     connection.scalar.return_value = True
     cli.acquire_lock(connection)
     connection.commit.assert_called_once()
+
+
+def test_grants_reject_partial_upgrade_before_connecting(monkeypatch):
+    """Never commit a partial upgrade and then fail applying head-only grants."""
+    monkeypatch.setenv("APPLY_DATABASE_GRANTS", "true")
+    create_engine = Mock()
+    monkeypatch.setattr(cli, "create_engine", create_engine)
+    with pytest.raises(ValueError, match="upgrade head"):
+        cli.migrate("upgrade", "0004_guards")
+    create_engine.assert_not_called()
+
+
+@pytest.mark.parametrize("fail_grants", [False, True])
+def test_deployment_grants_are_locked_and_failures_propagate(monkeypatch, fail_grants):
+    """A failed grant step must fail the deployment and always release its lock."""
+    monkeypatch.setenv("APPLY_DATABASE_GRANTS", "true")
+    monkeypatch.setenv("DATABASE_DSN", "postgresql://test:unused@localhost/disposable")
+    connection = MagicMock()
+    connection.invalidated = False
+    session = MagicMock()
+    session.__enter__.return_value = connection
+    engine = Mock()
+    monkeypatch.setattr(cli, "create_engine", Mock(return_value=engine))
+    monkeypatch.setattr(cli, "connect", Mock(return_value=session))
+    lock = Mock()
+    monkeypatch.setattr(cli, "acquire_lock", lock)
+    upgrade = Mock()
+    monkeypatch.setattr(cli.command, "upgrade", upgrade)
+    if fail_grants:
+        connection.exec_driver_sql.side_effect = RuntimeError("grant rejected")
+        with pytest.raises(RuntimeError, match="grant rejected"):
+            cli.migrate("upgrade", "head")
+    else:
+        cli.migrate("upgrade", "head")
+    lock.assert_called_once_with(connection)
+    upgrade.assert_called_once()
+    sql = connection.exec_driver_sql.call_args.args[0]
+    assert "metabase_reader" in sql and "curves_collector" in sql
+    connection.rollback.assert_called_once()
+    assert "pg_advisory_unlock" in str(connection.execute.call_args.args[0])
+    engine.dispose.assert_called_once()

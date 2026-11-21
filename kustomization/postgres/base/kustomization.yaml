@@ -5,3 +5,10 @@ resources:
 - postgres-service.yaml
 - postgres-headless-service.yaml
 - pvc.yaml
+- bootstrap-job.yaml
+configMapGenerator:
+- name: postgres-bootstrap-sql
+  files:
+  - bootstrap.sql
+generatorOptions:
+  disableNameSuffixHash: true

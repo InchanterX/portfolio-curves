@@ -1,6 +1,8 @@
 import argparse
 import logging
+import os
 import time
+from pathlib import Path
 
 from alembic import command
 from sqlalchemy import Connection, Engine, create_engine, text
@@ -24,7 +26,8 @@ def connect(engine: Engine, timeout: float = CONNECT_TIMEOUT) -> Connection:
         except OperationalError as error:
             state = getattr(error.orig, "sqlstate", None)
             if state and not (state.startswith("08") or state == "57P03"):
-                raise RuntimeError("PostgreSQL rejected the connection") from None
+                raise RuntimeError(
+                    "PostgreSQL rejected the connection") from None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("PostgreSQL connection timeout") from None
@@ -49,6 +52,12 @@ def acquire_lock(connection: Connection, timeout: float = LOCK_TIMEOUT) -> None:
 
 def migrate(action: str, revision: str | None = None) -> None:
     """Execute Alembic on the same PostgreSQL session that owns the lock."""
+    if (
+        action == "upgrade"
+        and os.environ.get("APPLY_DATABASE_GRANTS") == "true"
+        and revision not in {None, "head"}
+    ):
+        raise ValueError("Database grants require upgrade head")
     config = alembic_config()
     if action == "history":
         command.history(config)
@@ -69,6 +78,13 @@ def migrate(action: str, revision: str | None = None) -> None:
                 config.attributes["connection"] = connection
                 if action == "upgrade":
                     command.upgrade(config, revision or "head")
+                    if os.environ.get("APPLY_DATABASE_GRANTS") == "true":
+                        connection.exec_driver_sql(
+                            Path(__file__)
+                            .with_name("grants.sql")
+                            .read_text(encoding="utf-8")
+                        )
+                        connection.commit()
                 elif action == "downgrade":
                     command.downgrade(config, revision)
                 else:
@@ -77,7 +93,8 @@ def migrate(action: str, revision: str | None = None) -> None:
                 connection.rollback()
                 if locked and not connection.invalidated:
                     connection.execute(
-                        text("SELECT pg_advisory_unlock(:key)"), {"key": LOCK_KEY}
+                        text("SELECT pg_advisory_unlock(:key)"), {
+                            "key": LOCK_KEY}
                     )
                     connection.commit()
     finally:

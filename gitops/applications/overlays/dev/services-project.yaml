@@ -12,15 +12,11 @@ spec:
   - server: https://kubernetes.default.svc
     namespace: curves-postgres-dev
   - server: https://kubernetes.default.svc
-    namespace: curves-analyzer-service-dev
-  - server: https://kubernetes.default.svc
-    namespace: curves-webapi-service-dev
-  - server: https://kubernetes.default.svc
-    namespace: curves-frontend-dev
-  - server: https://kubernetes.default.svc
     namespace: curves-collector-job-dev
   - server: https://kubernetes.default.svc
     namespace: curves-migrations-dev
+  - server: https://kubernetes.default.svc
+    namespace: curves-metabase-dev
   orphanedResources:
     warn: true
   clusterResourceWhitelist: []

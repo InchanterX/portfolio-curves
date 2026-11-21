@@ -128,13 +128,13 @@ def test_schema_cycle(database):
     cli.migrate("upgrade", "head")
 
 
-def test_only_curve_and_auth_tables_remain(connection):
-    """Keep portfolio data and private credentials outside reporting views."""
+def test_only_domain_tables_remain(connection):
+    """Keep domain tables and deals, with authentication owned by Metabase."""
     tables = set(
         connection.scalars(
             text(
                 "SELECT schemaname || '.' || tablename FROM pg_tables "
-                "WHERE schemaname IN ('ref', 'market', 'app', 'calc', 'audit', 'auth')"
+                "WHERE schemaname IN ('ref', 'market', 'app', 'calc', 'audit', 'auth') OR (schemaname = 'public' AND tablename = 'deals')"
             )
         )
     )
@@ -152,9 +152,7 @@ def test_only_curve_and_auth_tables_remain(connection):
         "calc.base_point_source",
         "calc.stressed_curve_point",
         "audit.audit_log",
-        "auth.user_account",
-        "auth.user_session",
-        "auth.action_token",
+        "public.deals",
     }
     views = set(
         connection.scalars(
@@ -170,222 +168,27 @@ def test_only_curve_and_auth_tables_remain(connection):
     )
 
 
-def user_account(connection, email="viewer@example.test"):
-    """Insert an unconfirmed test account without creating real credentials."""
-    return connection.scalar(
+def test_deals_contract(connection):
+    """Preserve all nullable partner fields and array types without inferred keys."""
+    columns = connection.execute(
         text(
-            "INSERT INTO auth.user_account(email, display_name, password_hash) "
-            "VALUES (:email, 'Test user', 'synthetic-test-hash') RETURNING id"
-        ),
-        {"email": email},
-    )
-
-
-def test_user_roles_email_and_status(connection):
-    """Default to viewer and enforce unique emails, two roles and account states."""
-    user = user_account(connection)
-    params = {"user": user}
-    assert tuple(
-        connection.execute(
-            text("SELECT role, status FROM auth.user_account WHERE id = :user"), params
-        ).one()
-    ) == ("viewer", "pending")
-    reject(
-        connection,
-        "INSERT INTO auth.user_account(email, display_name, password_hash) VALUES ('VIEWER@example.test', 'Other', 'hash')",
-    )
-    reject(
-        connection,
-        "UPDATE auth.user_account SET role = 'admin' WHERE id = :user",
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE auth.user_account SET status = 'unknown' WHERE id = :user",
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE auth.user_account SET status = 'active' WHERE id = :user",
-        params,
-    )
-    connection.execute(
+            "SELECT column_name, udt_name, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'deals' ORDER BY ordinal_position"
+        )
+    ).all()
+    assert len(columns) == 51
+    assert all(row.is_nullable == "YES" for row in columns)
+    types = {row.column_name: row.udt_name for row in columns}
+    assert types["interest_payment"] == "_int8"
+    assert types["principal_payment_amounts"] == "_float8"
+    assert types["current_principal_amt"] == "float8"
+    assert not connection.scalar(
         text(
-            "UPDATE auth.user_account SET role = 'editor', status = 'active', "
-            "email_confirmed_at = now(), updated_at = now() WHERE id = :user"
-        ),
-        params,
-    )
-    connection.execute(
-        text("UPDATE auth.user_account SET status = 'disabled' WHERE id = :user"),
-        params,
-    )
-
-
-def test_sessions_and_action_tokens(connection):
-    """Validate token hashes, lifetimes, user links and independent sessions."""
-    user = user_account(connection)
-    params = {"user": user}
-    connection.execute(
-        text(
-            "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES "
-            "(:user, repeat('a', 64), now() + interval '1 day'), "
-            "(:user, repeat('b', 64), now() + interval '1 day')"
-        ),
-        params,
-    )
-    connection.execute(
-        text(
-            "UPDATE auth.user_session SET revoked_at = now() WHERE token_hash = repeat('a', 64)"
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.deals'::regclass"
         )
     )
-    assert (
-        connection.scalar(
-            text("SELECT count(*) FROM auth.user_session WHERE revoked_at IS NULL")
-        )
-        == 1
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES (:user, repeat('a', 64), now() + interval '1 day')",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES (:user, 'plaintext', now() + interval '1 day')",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES (:user, repeat('c', 64), now())",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.user_session(user_id, token_hash, expires_at) VALUES (:user + 1000000, repeat('c', 64), now() + interval '1 day')",
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE auth.user_session SET revoked_at = created_at - interval '1 second'",
-    )
-    connection.execute(
-        text(
-            "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES "
-            "(:user, 'verify_email', repeat('c', 64), now() + interval '1 hour'), "
-            "(:user, 'reset_password', repeat('d', 64), now() + interval '1 hour')"
-        ),
-        params,
-    )
-    connection.execute(
-        text(
-            "UPDATE auth.action_token SET used_at = now() WHERE purpose = 'verify_email'"
-        )
-    )
-    assert (
-        connection.scalar(
-            text("SELECT count(*) FROM auth.action_token WHERE used_at IS NULL")
-        )
-        == 1
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user, 'verify_email', repeat('c', 64), now() + interval '1 hour')",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user, 'other', repeat('e', 64), now() + interval '1 hour')",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user, 'reset_password', repeat('e', 64), now())",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user, 'reset_password', 'plaintext', now() + interval '1 hour')",
-        params,
-    )
-    reject(
-        connection,
-        "INSERT INTO auth.action_token(user_id, purpose, token_hash, expires_at) VALUES (:user + 1000000, 'reset_password', repeat('e', 64), now() + interval '1 hour')",
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE auth.action_token SET used_at = created_at - interval '1 second'",
-    )
-    reject(connection, "DELETE FROM auth.user_account WHERE id = :user", params)
-
-
-def test_user_authorship_and_immutability(connection):
-    """Retain user identities on immutable versions, runs and audit records."""
-    user = user_account(connection)
-    other = user_account(connection, "other@example.test")
-    inputs = curve_inputs(connection)
-    params = {**inputs, "user": user, "other": other}
-    connection.execute(
-        text(
-            "UPDATE app.methodology_version SET created_by_user_id = :user "
-            "WHERE code = 'irrbb_initial'"
-        ),
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE app.methodology_version SET created_by_user_id = :user + 1000000 WHERE code = 'irrbb_initial'",
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE app.methodology_version SET created_by_user_id = :user WHERE id = :methodology",
-        params,
-    )
-    scenario = connection.scalar(
-        text(
-            "INSERT INTO app.scenario(code, version_no, name, shift_type, created_by, created_by_user_id) "
-            "VALUES ('user_base', 1, 'User base', 'base', 'Test user', :user) RETURNING id"
-        ),
-        params,
-    )
-    reject(
-        connection,
-        "UPDATE app.scenario SET created_by_user_id = :other WHERE id = :scenario",
-        {**params, "scenario": scenario},
-    )
-    run = connection.scalar(
-        text(
-            "INSERT INTO calc.curve_run(curve_id, methodology_id, bucket_set_id, "
-            "reporting_date, created_by, created_by_user_id) VALUES "
-            "(:curve, :methodology, :grid, '2026-01-01', 'Test user', :user) RETURNING id"
-        ),
-        params,
-    )
-    connection.execute(
-        text("INSERT INTO calc.run_scenario VALUES (:run, :scenario)"),
-        {"run": run, "scenario": scenario},
-    )
-    reject(
-        connection,
-        "UPDATE calc.curve_run SET created_by_user_id = :other WHERE id = :run",
-        {**params, "run": run},
-    )
-    connection.execute(
-        text(
-            "INSERT INTO audit.audit_log(actor, actor_user_id, action, entity_type, entity_id) "
-            "VALUES ('Test user', :user, 'test', 'test', 1)"
-        ),
-        params,
-    )
-    reject(connection, "UPDATE audit.audit_log SET actor_user_id = :other", params)
-    reject(
-        connection,
-        "INSERT INTO audit.audit_log(actor, actor_user_id, action, entity_type, entity_id) VALUES ('unknown', :user + 1000000, 'test', 'test', 1)",
-        params,
-    )
-    reject(connection, "DELETE FROM auth.user_account WHERE id = :user", params)
+    connection.execute(text("INSERT INTO public.deals DEFAULT VALUES"))
+    assert connection.scalar(text("SELECT to_regnamespace('auth')")) is None
 
 
 def test_seed_data(connection):
@@ -600,7 +403,7 @@ def test_failed_revision_is_rolled_back(database, tmp_path, monkeypatch):
     (target / "versions/0005_success.py").write_text(
         "from alembic import op\n"
         "revision = '0005_success'\n"
-        "down_revision = '0004_guards'\n"
+        "down_revision = '0006_deals'\n"
         "def upgrade():\n"
         "    op.execute('CREATE TABLE public.committed_probe(id integer)')\n"
         "def downgrade():\n"
@@ -639,4 +442,43 @@ def test_failed_revision_is_rolled_back(database, tmp_path, monkeypatch):
             text("SELECT pg_advisory_unlock(:key)"), {"key": cli.LOCK_KEY}
         )
         connection.commit()
+    cli.migrate("downgrade", "0006_deals")
+
+
+def test_upgrade_from_legacy_auth_preserves_actor(database):
+    """Upgrade an existing revision and preserve audit authors after removing auth."""
     cli.migrate("downgrade", "0004_guards")
+    try:
+        with database.begin() as connection:
+            user_id = connection.scalar(
+                text(
+                    "INSERT INTO auth.user_account(email, display_name, password_hash) "
+                    "VALUES ('legacy@example.test', 'Legacy', 'unused') RETURNING id"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO audit.audit_log(actor, actor_user_id, action, entity_type, entity_id) "
+                    "VALUES ('Legacy actor', :user_id, 'legacy-test', 'test', 1)"
+                ),
+                {"user_id": user_id},
+            )
+        cli.migrate("upgrade", "head")
+        with database.connect() as connection:
+            assert connection.scalar(text("SELECT to_regnamespace('auth')")) is None
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT actor FROM audit.audit_log WHERE action = 'legacy-test'"
+                    )
+                )
+                == "Legacy actor"
+            )
+            assert (
+                connection.scalar(text("SELECT to_regclass('public.deals')"))
+                is not None
+            )
+    finally:
+        # This fixture is explicitly an empty disposable database, never production.
+        cli.migrate("downgrade", "base")
+        cli.migrate("upgrade", "head")

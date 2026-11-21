@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metabase
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: &id001
+      app.kubernetes.io/name: metabase
+      app.kubernetes.io/part-of: curves
+  template:
+    metadata:
+      labels: *id001
+    spec:
+      serviceAccountName: app
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: app
+        image: registry.faberge-eggs.ru/curves/metabase:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 3000
+        env:
+        - name: MB_DB_TYPE
+          value: postgres
+        - name: MB_DB_HOST
+          value: postgres
+        - name: MB_DB_PORT
+          value: '5432'
+        - name: MB_DB_DBNAME
+          value: metabase_app
+        - name: MB_DB_USER
+          value: metabase_app
+        - name: JAVA_OPTS
+          value: -Xms256m -Xmx1g -XX:+ExitOnOutOfMemoryError
+        - name: MB_DB_PASS
+          valueFrom:
+            secretKeyRef:
+              name: metabase-auth
+              key: MB_DB_PASS
+        - name: MB_ENCRYPTION_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: metabase-auth
+              key: MB_ENCRYPTION_SECRET_KEY
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: '2'
+            memory: 2Gi
+        startupProbe:
+          httpGet:
+            path: /api/health
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6

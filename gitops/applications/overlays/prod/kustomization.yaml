@@ -6,8 +6,6 @@ resources:
 - services-project.yaml
 - infrastructure.yaml
 - postgres.yaml
-- analyzer-service.yaml
-- webapi-service.yaml
-- frontend.yaml
 - collector-job.yaml
 - migrations.yaml
+- metabase.yaml

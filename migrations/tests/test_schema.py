@@ -14,8 +14,28 @@ def schema_sources() -> tuple[str, str]:
     """Read table definitions and the corresponding human-readable DBML."""
     sql = "\n".join(
         (VERSIONS / name).read_text(encoding="utf-8")
-        for name in ["0001_inputs.sql", "0002_calculations.sql"]
+        for name in ["0001_inputs.sql", "0002_calculations.sql", "0006_deals.sql"]
     )
+    removals = (VERSIONS / "0005_remove_legacy_auth.sql").read_text(encoding="utf-8")
+    for table in re.findall(r"DROP TABLE ([\w.]+);", removals):
+        sql = re.sub(
+            rf"CREATE TABLE {re.escape(table)} \(\n.*?\n\);\n", "", sql, flags=re.S
+        )
+        sql = re.sub(
+            rf"^CREATE (?:UNIQUE )?INDEX .* ON {re.escape(table)}\(.*\);\n",
+            "",
+            sql,
+            flags=re.M,
+        )
+    for _table, column in re.findall(
+        r"ALTER TABLE ([\w.]+) DROP COLUMN (\w+);", removals
+    ):
+        # Column names are shared by authorship fields; all are explicitly removed.
+        sql = re.sub(rf"^    {column} .*\n", "", sql, flags=re.M)
+    for name in re.findall(r"DROP CONSTRAINT (\w+);", removals):
+        sql = re.sub(rf"^    CONSTRAINT {name} .*\n", "", sql, flags=re.M)
+    for name in re.findall(r"DROP INDEX [\w]+\.(\w+);", removals):
+        sql = re.sub(rf"^CREATE (?:UNIQUE )?INDEX {name} .*\n", "", sql, flags=re.M)
     return sql, (ROOT / "docs/schema.dbml").read_text(encoding="utf-8")
 
 
@@ -33,22 +53,26 @@ def test_dbml_tables_columns_and_defaults():
     for name, body in sql_tables.items():
         sql_columns = {}
         for column, kind, settings in re.findall(
-            r"^    ([a-z_][a-z0-9_]*) ([a-z]+(?:\([\d,]+\))?)([^\n]*)", body, re.M
+            r"^    ([a-z_][a-z0-9_]*) ([a-z][a-z0-9]*(?: precision)?(?:\([\d,]+\))?(?:\[\])?)([^\n]*)",
+            body,
+            re.M,
         ):
             default = re.search(r"DEFAULT ([^,\n]+)", settings)
             sql_columns[column] = (
-                kind,
+                kind.replace("double precision", "float8"),
                 "NOT NULL" in settings or "IDENTITY" in settings,
                 "IDENTITY" in settings,
                 normalize(default[1]) if default else None,
             )
         dbml_columns = {}
         for column, kind, settings in re.findall(
-            r'^  "(\w+)" ([a-z]+(?:\([\d,]+\))?)([^\n]*)', dbml_tables[name], re.M
+            r'^  "(\w+)" ([a-z][a-z0-9]*(?: precision)?(?:\([\d,]+\))?(?:\[\])?)([^\n]*)',
+            dbml_tables[name],
+            re.M,
         ):
             default = re.search(r"default: ([^\]]+)", settings)
             dbml_columns[column] = (
-                kind,
+                kind.replace("double precision", "float8"),
                 "not null" in settings,
                 "increment" in settings,
                 normalize(default[1]) if default else None,
