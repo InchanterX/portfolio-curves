@@ -10,4 +10,4 @@ patches:
 - path: configuration.yaml
 images:
 - name: registry.faberge-eggs.ru/curves/metabase
-  newTag: sha-9c0dac66ab6e8c7b4b27bd2c1f35707f7315f6dc
+  newTag: sha-e05ece96682e4fff87ca5f2631541302c3a8f686

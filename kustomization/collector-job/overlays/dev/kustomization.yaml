@@ -11,4 +11,4 @@ patches:
 - path: enable.yaml
 images:
 - name: registry.faberge-eggs.ru/curves/collector-job
-  newTag: latest
+  newTag: sha-e05ece96682e4fff87ca5f2631541302c3a8f686
