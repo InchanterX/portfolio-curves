@@ -32,7 +32,9 @@ RUN npm install -g bun
 # install frontend dependencies
 RUN bun install --frozen-lockfile
 
-RUN INTERACTIVE=false CI=true MB_EDITION=$MB_EDITION bin/build.sh ${VERSION:+:version $VERSION}
+# Restore executable bits lost when the upstream sources were copied on Windows.
+RUN grep -rlZ '^#!' bin | xargs -0 -r chmod a+x \
+    && INTERACTIVE=false CI=true MB_EDITION=$MB_EDITION bin/build.sh ${VERSION:+:version $VERSION}
 
 # ###################
 # # STAGE 2: runner
@@ -66,7 +68,7 @@ RUN cat /app/certs/blocked.certs >> /opt/java/openjdk/lib/security/blocked.certs
 
 # add Metabase script and uberjar
 COPY --from=builder /home/node/target/uberjar/metabase.jar /app/
-COPY bin/docker/run_metabase.sh /app/
+COPY --chmod=755 bin/docker/run_metabase.sh /app/
 
 # expose our default runtime port
 EXPOSE 3000
