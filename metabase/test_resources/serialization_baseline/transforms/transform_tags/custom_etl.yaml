@@ -1,4 +1,0 @@
-entity_id: Z2nTZwFTBUz1Yil8AKrp2
-name: custom-etl
-serdes/meta:
-- model: TransformTag

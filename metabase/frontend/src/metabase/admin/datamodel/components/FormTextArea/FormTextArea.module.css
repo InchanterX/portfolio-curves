@@ -1,3 +1,0 @@
-.error:not(:focus) {
-  border-color: var(--mb-color-feedback-negative);
-}

@@ -1,1 +1,0 @@
-export { BrandColorSettings } from "./BrandColorSettings";

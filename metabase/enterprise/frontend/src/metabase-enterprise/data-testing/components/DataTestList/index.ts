@@ -1,1 +1,0 @@
-export { DataTestList } from "./DataTestList";

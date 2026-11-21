@@ -1,1 +1,0 @@
-export { ChartColorPreview } from "./ChartColorPreview";

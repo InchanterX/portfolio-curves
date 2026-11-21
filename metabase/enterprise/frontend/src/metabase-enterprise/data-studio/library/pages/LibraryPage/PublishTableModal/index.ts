@@ -1,1 +1,0 @@
-export { PublishTableModal } from "./PublishTableModal";

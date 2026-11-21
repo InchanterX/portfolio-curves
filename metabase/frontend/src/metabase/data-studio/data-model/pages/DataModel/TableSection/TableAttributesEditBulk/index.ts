@@ -1,1 +1,0 @@
-export { TableAttributesEditBulk } from "./TableAttributesEditBulk";

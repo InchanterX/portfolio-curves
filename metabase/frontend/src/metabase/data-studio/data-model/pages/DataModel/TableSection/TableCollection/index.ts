@@ -1,1 +1,0 @@
-export { TableCollection } from "./TableCollection";

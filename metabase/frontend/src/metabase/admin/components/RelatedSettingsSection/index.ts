@@ -1,1 +1,0 @@
-export { RelatedSettingCard } from "./RelatedSettingsSection";

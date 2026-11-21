@@ -1,4 +1,0 @@
-export const METABASE_INSTANCE_URL: string = Cypress.expose("BACKEND_URL");
-export const AUTH_PROVIDER_URL = "http://auth-provider/sso";
-export const JWT_SHARED_SECRET =
-  "0000000000000000000000000000000000000000000000000000000000000000";

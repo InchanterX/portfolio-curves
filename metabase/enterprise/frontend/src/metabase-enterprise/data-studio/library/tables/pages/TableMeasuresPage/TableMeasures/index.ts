@@ -1,1 +1,0 @@
-export { TableMeasures } from "./TableMeasures";

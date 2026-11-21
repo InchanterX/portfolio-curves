@@ -1,4 +1,0 @@
-.verticalLegend {
-  /* the column stretches to the chart height but must never grow it */
-  contain: size;
-}

@@ -1,1 +1,0 @@
-export { SnippetCollectionHeaderMenu } from "./SnippetCollectionHeaderMenu";

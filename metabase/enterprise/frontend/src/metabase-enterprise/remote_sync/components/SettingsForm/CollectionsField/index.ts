@@ -1,1 +1,0 @@
-export { CollectionsField } from "./CollectionsField";

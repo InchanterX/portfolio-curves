@@ -1,8 +1,0 @@
-field_id:
-- Sample Database
-- PUBLIC
-- ORDERS
-- TOTAL
-description: Total order amount including tax
-serdes/meta:
-- model: FieldUserSettings

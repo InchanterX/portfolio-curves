@@ -1,1 +1,0 @@
-export { DashboardEventsSidebar } from "./DashboardEventsSidebar";

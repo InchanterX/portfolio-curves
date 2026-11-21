@@ -1,1 +1,0 @@
-export { McpToolsAccessPage } from "./McpToolsAccessPage";

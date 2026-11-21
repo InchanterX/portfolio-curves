@@ -1,8 +1,0 @@
-name: total
-active: true
-table_id:
-- Sample Database
-- PUBLIC
-- orders
-serdes/meta:
-- model: Field

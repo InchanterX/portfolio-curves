@@ -1,1 +1,0 @@
-export { MetadataCard } from "./MetadataCard";

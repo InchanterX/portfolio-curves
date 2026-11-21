@@ -1,1 +1,0 @@
-export { ChartColorSample } from "./ChartColorSample";

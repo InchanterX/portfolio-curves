@@ -1,1 +1,0 @@
-export { SnippetsSectionLayout } from "./SnippetsSectionLayout";

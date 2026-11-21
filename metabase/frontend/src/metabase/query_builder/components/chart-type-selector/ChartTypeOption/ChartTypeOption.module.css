@@ -1,8 +1,0 @@
-.SettingsButton {
-  opacity: 0;
-}
-
-.VisualizationButton:hover + .SettingsButton,
-.SettingsButton:hover {
-  opacity: 1;
-}

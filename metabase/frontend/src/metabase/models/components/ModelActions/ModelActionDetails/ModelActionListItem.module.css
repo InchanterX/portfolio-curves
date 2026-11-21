@@ -1,5 +1,0 @@
-.dotSeparated:not(:last-child)::after {
-  content: "·";
-  margin-left: 0.375rem;
-  margin-right: 0.375rem;
-}

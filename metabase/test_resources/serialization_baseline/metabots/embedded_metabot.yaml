@@ -1,6 +1,0 @@
-name: Embedded Metabot
-description: Metabot instance for embedded metabase users.
-entity_id: embeddedmetabotmetabo
-serdes/meta:
-- model: Metabot
-prompts: []
