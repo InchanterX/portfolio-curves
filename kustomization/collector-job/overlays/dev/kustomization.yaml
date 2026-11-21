@@ -4,9 +4,11 @@ resources:
 - harbor-pull-secret.yaml
 - postgres-auth.yaml
 - ../../base
+- initial-job.yaml
 namespace: curves-collector-job-dev
 patches:
 - path: database.yaml
+- path: enable.yaml
 images:
 - name: registry.faberge-eggs.ru/curves/collector-job
   newTag: latest

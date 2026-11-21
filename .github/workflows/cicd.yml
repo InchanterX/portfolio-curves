@@ -49,9 +49,46 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "has_changes=$(jq '.include | length > 0' <<< "$matrix")" >> "$GITHUB_OUTPUT"
 
-  build:
+  integration:
     needs: detect
-    if: needs.detect.outputs.has_changes == 'true'
+    if: contains(needs.detect.outputs.matrix, '"name": "migrations"') || contains(needs.detect.outputs.matrix, '"name": "collector-job"')
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: curves_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d curves_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_DSN: postgresql://postgres:test-password@localhost:5432/curves_db
+      COLLECTOR_TEST_DSN: postgresql://postgres:test-password@localhost:5432/curves_db
+      PGPASSWORD: test-password
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: '0.9.7'
+      - name: Prepare schema and roles
+        run: |
+          psql -h localhost -U postgres -d curves_db -c 'CREATE ROLE metabase_reader; CREATE ROLE curves_collector; CREATE ROLE curves_migrator;'
+          uv run --project migrations --locked curves-migrate upgrade
+          psql -h localhost -U postgres -d curves_db -f migrations/src/curves_migrations/grants.sql -v ON_ERROR_STOP=1
+      - name: Check collector with PostgreSQL
+        run: uv run --project collector_job --locked pytest collector_job/tests -m integration -q
+
+  build:
+    needs: [detect, integration]
+    if: always() && needs.detect.outputs.has_changes == 'true' && (needs.integration.result == 'success' || needs.integration.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
@@ -62,7 +99,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        if: matrix.name == 'migrations'
+        if: matrix.name == 'migrations' || matrix.name == 'collector-job'
         with:
           version: '0.9.7'
       - name: Check migrations
@@ -70,6 +107,11 @@ jobs:
         run: |
           uv run --project migrations --locked ruff check migrations
           uv run --project migrations --locked pytest migrations/tests -m 'not integration' -q
+      - name: Check collector
+        if: matrix.name == 'collector-job'
+        run: |
+          uv run --project collector_job --locked ruff check collector_job
+          uv run --project collector_job --locked pytest collector_job/tests -m 'not integration' -q
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         if: github.event_name != 'pull_request'

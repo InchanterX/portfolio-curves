@@ -38,9 +38,9 @@ def test_packaged_revisions_are_independent_of_cwd(tmp_path, monkeypatch):
     """Discover a single migration head from any working directory."""
     monkeypatch.chdir(tmp_path)
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == ["0006_deals"]
+    assert script.get_heads() == ["0007_collector"]
     revisions = list(script.walk_revisions())
-    assert len(revisions) == 6
+    assert len(revisions) == 7
     for revision in revisions:
         if revision.revision in {"0001_inputs", "0002_calculations", "0004_guards"}:
             assert Path(revision.path).with_suffix(".sql").is_file()
